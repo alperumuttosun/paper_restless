@@ -26,9 +26,9 @@ pk <- c("jsonlite", "curl", "data.table", "haven", "readxl", "xml2", "poLCA")  #
 for (p in pk) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)  # install if missing
 
 # ---------- 1. Folder ----------
-roots <- c("C:/Users/Alper.Tosun/Desktop/cru130", "C:/Users/autos/OneDrive/Desktop/cru130")  # candidate root folders
+roots <- c("C:/Users/Alper.Tosun/Desktop/cru130", "C:/Users/autos/OneDrive/Desktop/cru130")  # replace with your own project folder path(s)
 root  <- roots[dir.exists(roots)][1]                                    # use the first existing folder
-if (is.na(root)) stop("cru130 klasoru bulunamadi.")
+if (is.na(root)) stop("Project folder not found; set your own path in roots.")
 proj  <- file.path(root, "paper_restless")                              # project folder
 if (!dir.exists(proj)) dir.create(proj)                                 # create once if missing
 setwd(proj)                                                             # working directory
@@ -49,7 +49,7 @@ write_out <- function(d, f) {                                           # write 
   ok <- tryCatch({ data.table::fwrite(d, f, bom = TRUE); TRUE },        # Route A: fwrite
                  error = function(e) FALSE)
   if (!ok) utils::write.csv(d, f, row.names = FALSE, fileEncoding = "UTF-8")  # Route B: write.csv
-  message("Yazildi: ", f)
+  message("Written: ", f)
 }
 lab <- function(v) {                                                    # SPSS labels as "[code] label"
   if (inherits(v, "haven_labelled")) as.character(haven::as_factor(v, levels = "both"))
@@ -82,7 +82,7 @@ for (v in names(rec_ids)) {
   if (is.null(fl) && v == "v1")                                         # fallback: known v1 CSV file name
     fl <- data.frame(key = "Restless_data.csv", size = NA, checksum = NA,
                      url = "https://zenodo.org/records/20541173/files/Restless_data.csv?download=1")
-  if (is.null(fl)) { message("Dosya listesi alinamadi: ", v); next }
+  if (is.null(fl)) { message("Could not retrieve file list: ", v); next }
   fl$version <- v
   fl$local   <- file.path(proj, paste0(v, "_", fl$key))                 # local name: v2_..., v1_...
   for (i in seq_len(nrow(fl))) {
@@ -93,8 +93,8 @@ for (v in names(rec_ids)) {
                      error = function(e) FALSE)                         # Route A: download.file
       if (!ok) ok <- tryCatch({ curl::curl_download(fl$url[i], fl$local[i]); TRUE },
                               error = function(e) FALSE)                # Route B: curl
-      message(if (ok) "Indirildi: " else "INDIRILEMEDI: ", fl$local[i])
-    } else message("Zaten var, atlandi: ", fl$local[i])
+      message(if (ok) "Downloaded: " else "DOWNLOAD FAILED: ", fl$local[i])
+    } else message("Already present, skipped: ", fl$local[i])
   }
   fl$local_size <- ifelse(file.exists(fl$local), file.size(fl$local), NA)
   fl$local_md5  <- ifelse(file.exists(fl$local), unname(tools::md5sum(fl$local)), NA)
@@ -128,10 +128,10 @@ datA  <- read_sav_safe(sav2)                                            # v2 SPS
 datB  <- read_csv_safe(csv2)                                            # v2 CSV
 datV1 <- read_csv_safe(csv1)                                            # v1 CSV
 dat   <- if (!is.null(datA)) datA else datB                             # use labelled SPSS if available
-if (is.null(dat)) stop("v2 verisi okunamadi.")
+if (is.null(dat)) stop("Could not read the v2 data.")
 
 RUN_STEP01 <- !file.exists("audit_06_ortak_orneklem.csv")                 # skip if step01 outputs exist
-if (!RUN_STEP01) message("step01 ciktilari mevcut, atlandi.")
+if (!RUN_STEP01) message("step01 outputs exist, skipped.")
 if (RUN_STEP01) {
 # --- audit_01: dimensions ---
 dims <- data.frame(kaynak = c("v2_sav", "v2_csv", "v1_csv"),
@@ -250,7 +250,7 @@ w <- w[stats::complete.cases(w[, c(need_v, tsk$f)]), ]                   # analy
 write_out(as.data.frame(table(ulke = w$Country)), "step02_analiz_orneklemi.csv")
 
 RUN_STEP02 <- !file.exists("step02_lca_capraz_K3.csv")                  # skip if step02 outputs exist
-if (!RUN_STEP02) message("step02 ciktilari mevcut, atlandi.")
+if (!RUN_STEP02) message("step02 outputs exist, skipped.")
 
 # --- variables shared by step02/03 ---
 w$n_task_do   <- rowSums(sapply(tsk$f, function(v) w[[v]] >= 2))          # number of tasks performed
@@ -448,7 +448,7 @@ hidden_row <- function(ft, lab) {                                        # summa
              C_Transportation = pk2(ft, J + which(tools == "Transportation"))[h]) }
 
 RUN_STEP03 <- !file.exists("step03_montecarlo.csv")                     # skip if step03 outputs exist
-if (!RUN_STEP03) message("step03 ciktilari mevcut, atlandi.")
+if (!RUN_STEP03) message("step03 outputs exist, skipped.")
 if (RUN_STEP03) {
 
 # ---------- 3a. Employees only (self-employed excluded) ----------
@@ -663,7 +663,7 @@ scen4 <- data.frame(senaryo = c("S1_bagimsiz", "S2_bagimli", "S3_bagimli_guclu",
 # 4a-4d. Observed data
 # =====================================================================
 RUN_4R <- !file.exists("step04_2d_gradyan.csv")                         # skip if the observed-data part exists
-if (!RUN_4R) message("step04 gercek veri ciktilari mevcut, atlandi.")
+if (!RUN_4R) message("step04 observed-data outputs exist, skipped.")
 if (RUN_4R) {
   YC2 <- make_YC(w, 2); iA <- 1:8; iB <- 9:16                             # A: need items, B: payment items
 
@@ -686,7 +686,7 @@ if (RUN_4R) {
 
   # best 2D model (BIC)
   f2s <- fs[fs$aile == "2B", ]
-  if (nrow(f2s) == 0) stop("2B model kurulamadi.")
+  if (nrow(f2s) == 0) stop("Two-dimensional model could not be fitted.")
   bn <- f2s$model[which.min(f2s$BIC)]; fb <- fits4[[bn]]
   write_out(cbind(model = bn, bvr_fun(YC2, fb)), "step04_bvr_2d_best.csv")
 
@@ -737,7 +737,7 @@ if (RUN_4R) {
 # 4e. Monte Carlo: M (standard, K = 2), C (standard, K = 4), C-2D (Ka = 2, Kb = 2)
 # =====================================================================
 RUN_4MC <- !file.exists("step04_montecarlo.csv")
-if (!RUN_4MC) message("step04 Monte Carlo ciktilari mevcut, atlandi.")
+if (!RUN_4MC) message("step04 Monte Carlo outputs exist, skipped.")
 if (RUN_4MC) {
   mc4 <- list()
   for (s in seq_len(nrow(scen4))) for (r in seq_len(MC_R4)) {
@@ -824,7 +824,7 @@ all5 <- utils::read.csv("step05_2d_uyum_genis.csv", fileEncoding = "UTF-8-BOM")
 # selection: first model in BIC order with all marginal classes >= 5%
 choose_fit <- function() {
   i <- which(all5$en_kucuk_A >= MIN_SINIF & all5$en_kucuk_B >= MIN_SINIF)[1]
-  if (is.na(i)) stop("Uygun model bulunamadi.")
+  if (is.na(i)) stop("No model satisfies the selection rule.")
   nm <- all5$model[i]
   f <- if (!is.null(fits5[[nm]])) fits5[[nm]] else lca2d_em(YC5, iA5, iB5, all5$Ka[i], all5$Kb[i], nrep = NREP5)
   list(fit = f, model = nm, sira = i)
@@ -950,7 +950,7 @@ both_grad <- function(ft, wt = NULL) {                                   # both 
 }
 
 RUN_6 <- !file.exists("step06_altgrup_gradyan.csv")
-if (!RUN_6) message("step06 hesaplamalari mevcut, atlandi (tablolar ve sekiller yeniden uretilir).")
+if (!RUN_6) message("step06 computations exist, skipped (tables are regenerated).")
 if (RUN_6) {
   # ---------- 6a. 12 models ----------
   old5 <- utils::read.csv("step05_2d_uyum_genis.csv", fileEncoding = "UTF-8-BOM")
@@ -971,7 +971,7 @@ if (RUN_6) {
   # selected model (same rule as step05)
   sel <- utils::read.csv("step05_secilen_model.csv", fileEncoding = "UTF-8-BOM")$secilen_model[1]
   f6 <- fits6[[sel]]
-  if (is.null(f6)) stop("Secilen model kurulamadi: ", sel)
+  if (is.null(f6)) stop("Selected model could not be fitted: ", sel)
 
   # ---------- 6b. Bootstrap ----------
   init6 <- list(P = f6$P, thA = f6$thA, thB = f6$thB); bt6 <- list()
@@ -1090,7 +1090,7 @@ if (file.exists("step06_gradyan_ci.csv")) {
 # Table: external validity of compensation classes (step05)
 if (file.exists("step05_B_sinif_dogrulama.csv")) write_out(rd("step05_B_sinif_dogrulama.csv"), "table6_compensation_validation.csv")
 
-message("\nBITTI. Ciktilar: ", proj)
+message("\nDONE. Outputs in: ", proj)
 
 # =====================================================================
 # STEP07 - additional checks
@@ -1186,7 +1186,7 @@ if (RUN_7C) {
   for (kk in list(c(6, 4), c(5, 5), c(6, 5))) {                          # 7b: larger models
     f <- tryCatch(lca2d_em(YC5, iA5, iB5, kk[1], kk[2], nrep = NREP7), error = function(e) NULL)
     if (!is.null(f)) rr[[length(rr) + 1]] <- fit_summary(f, YC5, paste0("2B_A", kk[1], "_B", kk[2]), iA5, iB5)
-    message("step07: ", kk[1], "x", kk[2], " tamam")
+    message("step07: ", kk[1], "x", kk[2], " done")
   }
   init_drop <- function(j) list(P = f7$P, thA = f7$thA[-j], thB = f7$thB[-j])  # start from the same solution
   for (j in seq_along(tools)) {                                          # 7c: drop each item in turn
@@ -1293,7 +1293,7 @@ if (RUN_B7 && !file.exists("step07_bootstrap1000_ci.csv")) {
     dI <- mean(pb$p_shift[!is.na(ib) & ib >= 5]) - mean(pb$p_shift[!is.na(ib) & ib >= 1 & ib <= 4])
     bt7[[length(bt7) + 1]] <- data.frame(tekrar = b, gradyan = g[["gradyan"]], P_aktaran_el = g[["P_aktaran_el"]],
                                          P_aktaran_diger = g[["P_aktaran_diger"]], ISCO_5_9_vs_1_4 = dI)
-    if (b %% 50 == 0) message("bootstrap ", b, "/", B7, " | gecen sure: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+    if (b %% 50 == 0) message("bootstrap ", b, "/", B7, " | elapsed: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
   }
   bt7 <- do.call(rbind, bt7); write_out(bt7, "step07_bootstrap1000_tekrarlar.csv")
   ci7 <- do.call(rbind, lapply(names(bt7)[-1], function(v) data.frame(olcu = v, ort = mean(bt7[[v]]), SE = stats::sd(bt7[[v]]),
@@ -1302,7 +1302,7 @@ if (RUN_B7 && !file.exists("step07_bootstrap1000_ci.csv")) {
   num <- sapply(ci7, is.numeric); ci7[num] <- lapply(ci7[num], round, 4)
   write_out(ci7, "step07_bootstrap1000_ci.csv")
 }
-message("step07 tamamlandi.")
+message("step07 completed.")
 
 
 # =====================================================================
@@ -1409,7 +1409,7 @@ if (RUN_9B) {
                                              gradyan = g[["gradyan"]], el_payi = g[["el_payi"]])
       if (all(kk == c(6, 5)) && (is.null(best65) || f$ll > best65$ll)) best65 <- f
     }
-    message("step09: ", kk[1], "x", kk[2], " ", NSTART9, " baslangic tamam")
+    message("step09: ", kk[1], "x", kk[2], " ", NSTART9, " starts done")
   }
   runs <- do.call(rbind, runs)
   runs$en_iyi_LL <- stats::ave(runs$LL, runs$model, FUN = max)
@@ -1530,7 +1530,7 @@ if (RUN_9E) {
   num <- sapply(long, is.numeric); long[num] <- lapply(long[num], round, 3)
   write_out(long, "step09_montecarlo.csv")
 }
-message("step09 tamamlandi.")
+message("step09 completed.")
 
 # =====================================================================
 # STEP10 - model selection and further checks
@@ -1583,7 +1583,7 @@ if (RUN_10A) {
     ms[[length(ms) + 1]] <- data.frame(model = paste0(kk[1], "x", kk[2]), Ka = kk[1], Kb = kk[2], LL = f$ll, npar = f$npar, BIC = f$bic,
       t(info_crit(f, nrow(YC5))), entropi = entropy(f$post), en_kucuk_A = min(mA), en_kucuk_B = min(mB),
       t(bvr_sum(bvr_fun(YC5, f))), gradyan_yeni = grad_gen(f, YC5, iA5)[["gradyan"]], gradyan_eski = grad_old(f, YC5, iA5))
-    message("step10a: ", kk[1], "x", kk[2], " tamam")
+    message("step10a: ", kk[1], "x", kk[2], " done")
   }
   ms <- do.call(rbind, ms)
   for (k in c("BIC", "AIC", "AIC3", "CAIC", "SABIC", "ICL_BIC")) ms[[paste0("en_iyi_", k)]] <- ms[[k]] == min(ms[[k]])
@@ -1605,7 +1605,7 @@ if (RUN_10B) {
     g <- grad_gen(fb, YC5, iA5)
     bt[[length(bt) + 1]] <- data.frame(tekrar = b, gradyan = g[["gradyan"]], P_aktaran_el = g[["P_aktaran_el"]],
                                        P_aktaran_diger = g[["P_aktaran_diger"]], gradyan_eski = grad_old(fb, YC5, iA5))
-    if (b %% 50 == 0) message("6x5 bootstrap ", b, "/", B10, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+    if (b %% 50 == 0) message("6x5 bootstrap ", b, "/", B10, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
   }
   bt <- do.call(rbind, bt); write_out(bt, "step10_bootstrap_6x5_tekrarlar.csv")
   g0 <- grad_gen(f65, YC5, iA5)
@@ -1683,7 +1683,7 @@ if (RUN_10D) {
       M = gap(shift_post4(fM, seq_along(tools))), C = gap(shift_post4(fC, 8 + seq_along(tools))),
       C2B_model = g2(fr)[1], C2B_kisi = g2(fr)[2], C2B_model_gercek_bas = g2(ft)[1],
       LL_rastgele = if (is.null(fr)) NA else fr$ll, LL_gercek_bas = if (is.null(ft)) NA else ft$ll)
-    if (r %% 5 == 0) message("S13 ", r, "/", MC_R10, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+    if (r %% 5 == 0) message("S13 ", r, "/", MC_R10, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
   }
   s13 <- do.call(rbind, s13)
   s13$rastgele_en_iyiye_ulasti <- s13$LL_rastgele >= s13$LL_gercek_bas - 0.01   # are 10 random starts sufficient?
@@ -1725,7 +1725,7 @@ if (!file.exists("step10_1d_bolunme.csv")) {
   out <- do.call(rbind, out); num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
   write_out(out, "step10_1d_bolunme.csv")
 }
-message("step10 tamamlandi.")
+message("step10 completed.")
 
 # =====================================================================
 # STEP11 - selected 6 x 5 model (lowest BIC with every class >= 5%)
@@ -1794,7 +1794,7 @@ out11 <- c("step11_18model_uc_tanim.csv", "step11_6x5_ozet.csv", "step11_isco.cs
 f11 <- NULL
 if (any(!file.exists(out11)) || needs_boot("step11_isco.csv")) {
   f11 <- lca2d_em(YC5, iA5, iB5, KA11, KB11, nrep = NREP11)              # same seeds as step10
-  message("step11: 6x5 kuruldu, LL = ", round(f11$ll, 2))
+  message("step11: 6x5 fitted, LL = ", round(f11$ll, 2))
 }
 
 # ---------- 11a. main model: summary, profiles, cells, BVR ----------
@@ -1838,7 +1838,7 @@ if (!file.exists("step11_bootstrap_ci.csv")) {
     }
     if (b %% 25 == 0 || b == B11) {                                      # checkpoint
       if (length(buf)) { done <- rbind(done, do.call(rbind, buf)); buf <- list(); write_out(done, fpart) }
-      message("step11 bootstrap ", b, "/", B11, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+      message("step11 bootstrap ", b, "/", B11, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
     }
   }
   bt <- rd(fpart); g0 <- grad3(f11, YC5, iA5); pp0 <- person_probs(f11, YC5, iA5)
@@ -1904,7 +1904,7 @@ if (!file.exists("step11_duyarlilik.csv")) {
                   error = function(e) NULL)                                                       # Route A: supplied + random
     if (is.null(f)) f <- tryCatch(lca2d_em(Yd, iAd, iBd, KA11, KB11, nrep = NREP11), error = function(e) NULL)   # Route B
     if (!is.null(f)) rr[[length(rr) + 1]] <- fit_sum11(f, Yd, paste0("cikarilan_", tools[j]), iAd)
-    message("step11 madde cikarma: ", tools[j])
+    message("step11 item deletion: ", tools[j])
   }
   for (th in c(3, 4)) {
     Yt <- make_YC(w, th)
@@ -1984,7 +1984,7 @@ if (!file.exists("step11_18model_uc_tanim.csv")) {
     f <- if (all(kk == c(KA11, KB11))) f11 else tryCatch(lca2d_em(YC5, iA5, iB5, kk[1], kk[2], nrep = NREP10), error = function(e) NULL)
     if (is.null(f)) next
     ms[[length(ms) + 1]] <- data.frame(model = paste0(kk[1], "x", kk[2]), Ka = kk[1], Kb = kk[2], LL = f$ll, BIC = f$bic, t(grad3(f, YC5, iA5)))
-    message("step11h: ", kk[1], "x", kk[2], " tamam")
+    message("step11h: ", kk[1], "x", kk[2], " done")
   }
   write_out(rnd(do.call(rbind, ms)), "step11_18model_uc_tanim.csv")
 }
@@ -2033,7 +2033,7 @@ if (!file.exists("step11_s13_montecarlo.csv")) {
       C2B_model = g2(fr)[1], C2B_kisi = g2(fr)[2], C2B_model_gercek_bas = g2(ft)[1],
       LL_rastgele = if (is.null(fr)) NA else fr$ll, LL_gercek_bas = if (is.null(ft)) NA else ft$ll)
     s13 <- rbind(s13, row); write_out(s13, fpart)                         # checkpoint after each replicate
-    message("S13 (6x5) ", r, "/", MC_R11, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+    message("S13 (6x5) ", r, "/", MC_R11, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
   }
   s13 <- rd(fpart); s13$rastgele_en_iyiye_ulasti <- s13$LL_rastgele >= s13$LL_gercek_bas - 0.01
   oz <- do.call(rbind, lapply(c("M", "C", "C2B_model", "C2B_kisi", "C2B_model_gercek_bas"), function(m) {
@@ -2043,7 +2043,7 @@ if (!file.exists("step11_s13_montecarlo.csv")) {
   oz$pct_rastgele_en_iyi <- 100 * mean(s13$rastgele_en_iyiye_ulasti, na.rm = TRUE)
   write_out(rnd(oz), "step11_s13_montecarlo.csv")
 }
-message("step11 tamamlandi.")
+message("step11 completed.")
 
 
 # =====================================================================
@@ -2055,8 +2055,8 @@ message("step11 tamamlandi.")
 NREP12 <- 10                                                             # number of starts (as in step02)
 if (!file.exists("step12_ari_izgara.csv")) {
   fM12 <- list(); fC12 <- list()
-  for (K in 2:5) { set.seed(12000 + K); fM12[[K]] <- run_lca(YM, K, NREP12); message("step12 birlesik K = ", K) }
-  for (K in 2:8) { set.seed(12100 + K); fC12[[K]] <- run_lca(YC, K, NREP12); message("step12 kosullu K = ", K) }
+  for (K in 2:5) { set.seed(12000 + K); fM12[[K]] <- run_lca(YM, K, NREP12); message("step12 merged K = ", K) }
+  for (K in 2:8) { set.seed(12100 + K); fC12[[K]] <- run_lca(YC, K, NREP12); message("step12 conditional K = ", K) }
   J <- length(tools); out <- list()
   for (kc in 2:8) {
     fc <- fC12[[kc]]; cC <- max.col(fc$post); h <- hidden_id(fc); inH <- cC == h
@@ -2073,7 +2073,7 @@ if (!file.exists("step12_ari_izgara.csv")) {
   out <- do.call(rbind, out); num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
   write_out(out, "step12_ari_izgara.csv")
 }
-message("step12 tamamlandi.")
+message("step12 completed.")
 
 # =====================================================================
 # STEP13 - partial measurement invariance
@@ -2136,14 +2136,14 @@ if (!file.exists("step13_kismi_degismezlik.csv")) {
                                  P_aktaran_el = pm, P_aktaran_diger = po, gradyan = pm - po))
     for (q in fr) thl[[length(thl) + 1]] <- data.frame(model = nm, madde = itB[q], B_sinif = seq_len(f11$Kb), aktaran = seq_len(f11$Kb) == bs,
       P_odenmeyen_diger = fd$thB[[q]][seq_len(f11$Kb), 2], P_odenmeyen_dusukPC = fd$thB[[q]][f11$Kb + seq_len(f11$Kb), 2])
-    message("step13: ", nm, " tamam")
+    message("step13: ", nm, " done")
   }
   num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
   write_out(out, "step13_kismi_degismezlik.csv")
   if (length(thl)) { th <- do.call(rbind, thl); th$fark <- th$P_odenmeyen_dusukPC - th$P_odenmeyen_diger
     num <- sapply(th, is.numeric); th[num] <- lapply(th[num], round, 4); write_out(th, "step13_kismi_B.csv") }
 }
-message("step13 tamamlandi.")
+message("step13 completed.")
 
 # =====================================================================
 # 6e. Figures (at the end; same file names, overwritten)
@@ -2205,13 +2205,13 @@ if (file.exists("step04_montecarlo_tekrarlar.csv")) {
       ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, margin = ggplot2::margin(t = 6)),
                      strip.text = ggplot2::element_text(margin = ggplot2::margin(4, 4, 4, 4)),
                      panel.spacing = grid::unit(0.8, "lines"))
-    save_gg(p1, "fig1_montecarlo_bias", 7.5, hh); TRUE }, error = function(e) { message("Sekil 1 Yol A: ", conditionMessage(e)); FALSE })
+    save_gg(p1, "fig1_montecarlo_bias", 7.5, hh); TRUE }, error = function(e) { message("Figure file 1, Route A: ", conditionMessage(e)); FALSE })
   if (!ok) base_both("fig1_montecarlo_bias", 7.5, hh, function() {       # Route B
     graphics::par(mfrow = c(nr, 3), mar = c(7, 5, 2.5, 1), mgp = c(3.2, 0.8, 0))
     for (s in levels(long$Scenario)) { d <- long[long$Scenario == s, ]
       graphics::boxplot(Error ~ Method, data = d, las = 2, main = s, ylab = "Error", xlab = "", cex.axis = .7)
       graphics::abline(h = 0, lty = 2) } })
-  message("Yazildi: fig1_montecarlo_bias.png / .pdf")
+  message("Written: fig1_montecarlo_bias.png / .pdf")
 }
 
 # Figure 1: P(B | A) in the selected model, with class labels
@@ -2252,7 +2252,7 @@ if (file.exists(hm_file)) {
                      legend.margin = ggplot2::margin(6, 8, 6, 8), legend.box.margin = ggplot2::margin(0, 0, 0, 14),
                      legend.background = ggplot2::element_rect(colour = "grey40", linewidth = 0.3),
                      legend.title = ggplot2::element_text(size = 9, margin = ggplot2::margin(b = 8)))
-    save_gg(p2, "fig2_need_by_compensation", 7, 4.6); TRUE }, error = function(e) { message("Sekil 2 Yol A: ", conditionMessage(e)); FALSE })
+    save_gg(p2, "fig2_need_by_compensation", 7, 4.6); TRUE }, error = function(e) { message("Figure file 2, Route A: ", conditionMessage(e)); FALSE })
   if (!ok) { mtx <- tapply(ce$PBgA, list(ce$Need, ce$Comp), sum)
     base_both("fig2_need_by_compensation", 7, 4.6, function() {
       graphics::layout(matrix(1:2, 1), widths = c(5, 1)); graphics::par(mar = c(5, 9, 1, 1), mgp = c(3.5, 0.8, 0))
@@ -2265,7 +2265,7 @@ if (file.exists(hm_file)) {
       graphics::par(mar = c(5, 1, 3, 4)); graphics::image(1, seq(0, 1, length.out = 100), t(matrix(seq(0, 1, length.out = 100))),
                      col = cl, axes = FALSE, xlab = "", ylab = ""); graphics::axis(4, las = 1); graphics::box()
       graphics::mtext("P(regime | need)", 3, line = 0.8, cex = .7) }) }
-  message("Yazildi: fig2_need_by_compensation.png / .pdf")
+  message("Written: fig2_need_by_compensation.png / .pdf")
 }
 
 # Figure 2: gradient, all models (BIC order)
@@ -2308,7 +2308,7 @@ if (file.exists("step06_12model_gradyan.csv")) {
                     shape = NULL, colour = NULL) + th_fig(10) +
       ggplot2::theme(legend.position = "bottom", legend.direction = "vertical", panel.grid.minor.y = ggplot2::element_blank(),
                      legend.margin = ggplot2::margin(t = 6))
-    save_gg(p3, "fig3_gradient_across_models", 6.5, 7); TRUE }, error = function(e) { message("Sekil 3 Yol A: ", conditionMessage(e)); FALSE })
+    save_gg(p3, "fig3_gradient_across_models", 6.5, 7); TRUE }, error = function(e) { message("Figure file 3, Route A: ", conditionMessage(e)); FALSE })
   if (!ok) base_both("fig3_gradient_across_models", 6.5, 6, function() {
     graphics::par(mar = c(6, 7, 1, 1), mgp = c(3.5, 0.8, 0)); yy <- rev(seq_len(nrow(g)))  # best BIC at the top
     graphics::plot(g$gradyan_yeni, yy + 0.17, pch = 16, yaxt = "n", xlab = "Need-profile gradient", ylab = "",
@@ -2317,5 +2317,5 @@ if (file.exists("step06_12model_gradyan.csv")) {
     if (any(!is.na(g$gradyan_dijital))) graphics::points(g$gradyan_dijital, yy, pch = 2, col = "grey30")
     graphics::axis(2, at = yy, labels = paste0(g$Ka, " x ", g$Kb), las = 1); graphics::abline(v = 0, lty = 2)
     graphics::legend("bottomright", c("Main definition", "Narrower definition", "Digital-need definition"), pch = c(16, 8, 2), col = c("black", "grey55", "grey30"), bty = "n") })
-  message("Yazildi: fig3_gradient_across_models.png / .pdf")
+  message("Written: fig3_gradient_across_models.png / .pdf")
 }
