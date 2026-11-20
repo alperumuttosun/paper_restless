@@ -1,0 +1,2321 @@
+# =====================================================================
+# Cumulative analysis script (step00-step13)
+#   step00: download the ReSTLess Open Database (v2 main, v1 for comparison); skipped if files exist
+#   step01: data audit
+#   step02: merged vs conditional coding: prevalence and one-dimensional latent class models
+#   step03: robustness of one-dimensional models (employees, K = 1-8, local dependence, threshold)
+#   step04: two-dimensional latent class model (need x compensation) and first Monte Carlo
+#   step05: model scan, bootstrap, validation of compensation regimes, subgroups
+#   step06: gradient under two group definitions; tables
+#   step07: occupation, larger models, item deletion, stricter threshold, Monte Carlo S5-S9
+#   step09: measurement assumption, random starts, threshold c = 4, excluded cases, Monte Carlo S10-S12
+#   step10: model selection criteria, model-free respondent-level measure, simulation S13
+#   step11: selected 6 x 5 model: profiles, bootstrap, subgroups, sensitivity, S13
+#   step12: agreement (ARI) between merged and conditional one-dimensional typologies
+#   step13: partial measurement invariance
+#   Figures are produced at the end of the script.
+# Each step is skipped if its output files already exist.
+# Route A / Route B: if one approach fails, the other is used.
+# =====================================================================
+
+# ---------- 0. Environment and encoding (UTF-8) ----------
+options(encoding = "UTF-8", stringsAsFactors = FALSE, timeout = 600)   # assume UTF-8; 10-minute download timeout
+invisible(suppressWarnings(try(Sys.setlocale("LC_CTYPE", "English_United States.utf8"), silent = TRUE)))  # UTF-8 locale on Windows
+
+pk <- c("jsonlite", "curl", "data.table", "haven", "readxl", "xml2", "poLCA")  # required packages
+for (p in pk) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)  # install if missing
+
+# ---------- 1. Folder ----------
+roots <- c("C:/Users/Alper.Tosun/Desktop/cru130", "C:/Users/autos/OneDrive/Desktop/cru130")  # candidate root folders
+root  <- roots[dir.exists(roots)][1]                                    # use the first existing folder
+if (is.na(root)) stop("cru130 klasoru bulunamadi.")
+proj  <- file.path(root, "paper_restless")                              # project folder
+if (!dir.exists(proj)) dir.create(proj)                                 # create once if missing
+setwd(proj)                                                             # working directory
+
+# ---------- helper functions ----------
+fix_utf8 <- function(x) {                                               # repair invalid UTF-8
+  x <- as.character(x)
+  bad <- !is.na(x) & !validUTF8(x)                                      # find invalid UTF-8 strings
+  if (any(bad)) x[bad] <- iconv(x[bad], "latin1", "UTF-8", sub = "")    # re-encode from latin1
+  x
+}
+clean_df <- function(d) {                                               # repair all character columns
+  for (j in seq_along(d)) if (is.character(d[[j]])) d[[j]] <- fix_utf8(d[[j]])
+  names(d) <- fix_utf8(names(d))
+  d
+}
+write_out <- function(d, f) {                                           # write CSV (Excel-compatible, with BOM)
+  ok <- tryCatch({ data.table::fwrite(d, f, bom = TRUE); TRUE },        # Route A: fwrite
+                 error = function(e) FALSE)
+  if (!ok) utils::write.csv(d, f, row.names = FALSE, fileEncoding = "UTF-8")  # Route B: write.csv
+  message("Yazildi: ", f)
+}
+lab <- function(v) {                                                    # SPSS labels as "[code] label"
+  if (inherits(v, "haven_labelled")) as.character(haven::as_factor(v, levels = "both"))
+  else as.character(v)
+}
+
+# =====================================================================
+# STEP00 - download
+# =====================================================================
+rec_ids <- c(v2 = "21993591", v1 = "20541173")                          # Zenodo record IDs
+
+list_A <- function(id) {                                                # Route A: API via jsonlite
+  js <- jsonlite::fromJSON(paste0("https://zenodo.org/api/records/", id))
+  data.frame(key = js$files$key, size = js$files$size,
+             checksum = js$files$checksum, url = js$files$links$self)
+}
+list_B <- function(id) {                                                # Route B: API via curl
+  tmp <- tempfile(fileext = ".json")
+  curl::curl_download(paste0("https://zenodo.org/api/records/", id), tmp)
+  js <- jsonlite::fromJSON(tmp)
+  data.frame(key = js$files$key, size = js$files$size, checksum = js$files$checksum,
+             url = paste0("https://zenodo.org/records/", id, "/files/",
+                          utils::URLencode(js$files$key, reserved = TRUE), "?download=1"))
+}
+
+flist <- list()
+for (v in names(rec_ids)) {
+  fl <- tryCatch(list_A(rec_ids[[v]]), error = function(e) NULL)       # Route A first
+  if (is.null(fl)) fl <- tryCatch(list_B(rec_ids[[v]]), error = function(e) NULL)  # then Route B
+  if (is.null(fl) && v == "v1")                                         # fallback: known v1 CSV file name
+    fl <- data.frame(key = "Restless_data.csv", size = NA, checksum = NA,
+                     url = "https://zenodo.org/records/20541173/files/Restless_data.csv?download=1")
+  if (is.null(fl)) { message("Dosya listesi alinamadi: ", v); next }
+  fl$version <- v
+  fl$local   <- file.path(proj, paste0(v, "_", fl$key))                 # local name: v2_..., v1_...
+  for (i in seq_len(nrow(fl))) {
+    need <- !file.exists(fl$local[i]) ||
+            (!is.na(fl$size[i]) && file.size(fl$local[i]) != fl$size[i])  # download only if missing or incomplete
+    if (need) {
+      ok <- tryCatch({ utils::download.file(fl$url[i], fl$local[i], mode = "wb", quiet = TRUE); TRUE },
+                     error = function(e) FALSE)                         # Route A: download.file
+      if (!ok) ok <- tryCatch({ curl::curl_download(fl$url[i], fl$local[i]); TRUE },
+                              error = function(e) FALSE)                # Route B: curl
+      message(if (ok) "Indirildi: " else "INDIRILEMEDI: ", fl$local[i])
+    } else message("Zaten var, atlandi: ", fl$local[i])
+  }
+  fl$local_size <- ifelse(file.exists(fl$local), file.size(fl$local), NA)
+  fl$local_md5  <- ifelse(file.exists(fl$local), unname(tools::md5sum(fl$local)), NA)
+  flist[[v]] <- fl
+}
+files_df <- do.call(rbind, flist)
+write_out(files_df[, c("version", "key", "size", "local_size", "checksum", "local_md5")],
+          "audit_00_zenodo_dosyalar.csv")                               # file list and md5 check
+
+# =====================================================================
+# STEP01 - data audit
+# =====================================================================
+pick <- function(v, pat) { x <- files_df$local[files_df$version == v & grepl(pat, files_df$key, ignore.case = TRUE)]
+                           x[file.exists(x)][1] }
+sav2 <- pick("v2", "\\.sav$"); csv2 <- pick("v2", "\\.csv$"); csv1 <- pick("v1", "\\.csv$")
+
+read_sav_safe <- function(f) {                                          # Route A: SPSS (with value labels)
+  if (is.na(f)) return(NULL)
+  d <- tryCatch(haven::read_sav(f), error = function(e)
+         tryCatch(haven::read_sav(f, encoding = "latin1"), error = function(e2) NULL))
+  if (is.null(d)) NULL else clean_df(as.data.frame(d))
+}
+read_csv_safe <- function(f) {                                          # Route B: CSV
+  if (is.na(f)) return(NULL)
+  d <- tryCatch(data.table::fread(f, encoding = "UTF-8", na.strings = c("", "NA")),
+                error = function(e) tryCatch(data.table::fread(f, encoding = "Latin-1", na.strings = c("", "NA")),
+                                             error = function(e2) NULL))
+  if (is.null(d)) NULL else clean_df(as.data.frame(d))
+}
+datA  <- read_sav_safe(sav2)                                            # v2 SPSS
+datB  <- read_csv_safe(csv2)                                            # v2 CSV
+datV1 <- read_csv_safe(csv1)                                            # v1 CSV
+dat   <- if (!is.null(datA)) datA else datB                             # use labelled SPSS if available
+if (is.null(dat)) stop("v2 verisi okunamadi.")
+
+RUN_STEP01 <- !file.exists("audit_06_ortak_orneklem.csv")                 # skip if step01 outputs exist
+if (!RUN_STEP01) message("step01 ciktilari mevcut, atlandi.")
+if (RUN_STEP01) {
+# --- audit_01: dimensions ---
+dims <- data.frame(kaynak = c("v2_sav", "v2_csv", "v1_csv"),
+                   dosya  = c(basename(sav2), basename(csv2), basename(csv1)),
+                   n_satir = c(NROW(datA), NROW(datB), NROW(datV1)),
+                   n_sutun = c(NCOL(datA), NCOL(datB), NCOL(datV1)))
+write_out(dims, "audit_01_genel.csv")
+
+# --- audit_02: all variables, missing values, example values ---
+vinfo <- do.call(rbind, lapply(names(dat), function(nm) {
+  x <- dat[[nm]]; xl <- lab(x)
+  data.frame(degisken = nm,
+             etiket   = fix_utf8(if (is.null(attr(x, "label"))) "" else attr(x, "label")),
+             sinif    = class(x)[1],
+             n_na     = sum(is.na(x)),
+             pct_na   = round(100 * mean(is.na(x)), 2),
+             n_negatif = if (is.numeric(x)) sum(x < 0, na.rm = TRUE) else NA,   # missing codes such as -99
+             n_farkli = length(unique(xl[!is.na(xl)])),
+             ornek    = paste(head(sort(unique(xl[!is.na(xl)])), 8), collapse = " | "))
+}))
+write_out(vinfo, "audit_02_degiskenler.csv")
+
+# --- country variable ---
+cc <- grep("^country", names(dat), ignore.case = TRUE, value = TRUE)[1]  # find the Country column
+ctry <- if (is.na(cc)) rep("ALL", nrow(dat)) else lab(dat[[cc]])         # single group if absent
+ctry[is.na(ctry)] <- "NA_country"
+
+# --- audit_03: country distribution (v2 and v1) ---
+t2 <- as.data.frame(table(ulke = ctry), stringsAsFactors = FALSE); t2$surum <- "v2"
+c1 <- if (!is.null(datV1)) grep("^country", names(datV1), ignore.case = TRUE, value = TRUE)[1] else NA
+t1 <- if (!is.na(c1)) { z <- as.data.frame(table(ulke = as.character(datV1[[c1]])), stringsAsFactors = FALSE); z$surum <- "v1"; z } else NULL
+write_out(rbind(t2, t1), "audit_03_ulke.csv")
+
+# --- key variables ---
+task_vars <- grep("_Frequency$|_Paid$", names(dat), ignore.case = TRUE, value = TRUE)   # task variables
+tool_vars <- grep("^Tools_|Need|Expens|Cover|Buy|Maint|Own|Safety", names(dat),
+                  ignore.case = TRUE, value = TRUE)                                   # material-cost variables
+key_vars  <- unique(c(task_vars, tool_vars))
+
+# --- audit_04: frequencies of key variables by country (incl. "not needed") ---
+freq <- do.call(rbind, lapply(key_vars, function(nm) {
+  tb <- as.data.frame(table(ulke = ctry, deger = lab(dat[[nm]]), useNA = "ifany"), stringsAsFactors = FALSE)
+  tb <- tb[tb$Freq > 0, ]
+  tb$pct_ulke_ici <- round(100 * tb$Freq / ave(tb$Freq, tb$ulke, FUN = sum), 2)       # percent within country
+  tb$degisken <- nm
+  tb[, c("degisken", "ulke", "deger", "Freq", "pct_ulke_ici")]
+}))
+write_out(freq, "audit_04_frekans_anahtar.csv")
+
+# --- audit_05: candidate weight variables ---
+wv <- grep("weight|wgt|wght|gewicht|poids|vikt|^w_|_w$", names(dat), ignore.case = TRUE, value = TRUE)
+wdf <- if (length(wv)) do.call(rbind, lapply(wv, function(nm) {
+  x <- suppressWarnings(as.numeric(dat[[nm]]))
+  data.frame(degisken = nm, n_na = sum(is.na(x)), min = min(x, na.rm = TRUE),
+             max = max(x, na.rm = TRUE), ort = mean(x, na.rm = TRUE))
+})) else data.frame(degisken = "agirlik degiskeni bulunamadi")
+write_out(wdf, "audit_05_agirlik.csv")
+
+# --- audit_06: complete cases by country ---
+cc_n <- function(vars) if (length(vars)) tapply(stats::complete.cases(dat[, vars, drop = FALSE]), ctry, sum) else NA
+cs <- data.frame(ulke = sort(unique(ctry)))
+cs$N_toplam        <- as.vector(table(ctry)[cs$ulke])
+cs$N_gorev_tam     <- as.vector(cc_n(task_vars)[cs$ulke])
+cs$N_malzeme_tam   <- as.vector(cc_n(tool_vars)[cs$ulke])
+cs$N_ikisi_tam     <- as.vector(cc_n(key_vars)[cs$ulke])
+write_out(cs, "audit_06_ortak_orneklem.csv")
+
+# --- audit_07: differences between v1 and v2 ---
+if (!is.null(datV1)) {
+  n2 <- names(if (!is.null(datB)) datB else dat); n1 <- names(datV1)
+  dif <- data.frame(kontrol = c("n_satir_v1", "n_satir_v2", "sadece_v1_sutun", "sadece_v2_sutun"),
+                    sonuc   = c(nrow(datV1), nrow(dat),
+                                paste(setdiff(n1, n2), collapse = " | "),
+                                paste(setdiff(n2, n1), collapse = " | ")))
+  write_out(dif, "audit_07_v1_v2_fark.csv")
+}
+
+# --- audit_08: codebook to text/CSV (xlsx / docx) ---
+cb <- files_df$local[files_df$version == "v2" & grepl("\\.(xlsx|xls|docx)$", files_df$key, ignore.case = TRUE)]
+for (f in cb[file.exists(cb)]) {
+  if (grepl("\\.xlsx?$", f, ignore.case = TRUE)) {                      # Excel codebook: one CSV per sheet
+    for (s in readxl::excel_sheets(f)) {
+      d <- clean_df(as.data.frame(readxl::read_excel(f, sheet = s, col_types = "text")))
+      write_out(d, paste0("audit_08_codebook_", gsub("[^A-Za-z0-9]", "_", s), ".csv"))
+    }
+  } else {                                                              # Word codebook: plain text
+    txt <- tryCatch({
+      td <- tempfile(); utils::unzip(f, "word/document.xml", exdir = td)   # read the docx XML
+      x <- xml2::read_xml(file.path(td, "word/document.xml"))
+      ps <- xml2::xml_find_all(x, ".//w:p", xml2::xml_ns(x))              # extract paragraphs
+      fix_utf8(xml2::xml_text(ps))
+    }, error = function(e) "docx okunamadi")
+    write_out(data.frame(satir = txt), "audit_08_codebook_metin.csv")
+  }
+}
+
+}  # end of step01
+
+# =====================================================================
+# STEP02 - conditional (among exposed) vs merged ("not needed = paid") coding
+# =====================================================================
+d2 <- if (!is.null(datA)) as.data.frame(haven::zap_labels(haven::read_sav(sav2))) else dat  # unlabelled numeric data
+for (j in names(d2)) if (!(j %in% c("Country", "ISCO_2D", "Panel_PSU", "Panel_Strata")))
+  d2[[j]] <- suppressWarnings(as.numeric(as.character(d2[[j]])))         # convert all variables to numeric
+d2$Country <- fix_utf8(as.character(d2$Country))
+w <- d2[!is.na(d2$Job_Paid_Work) & d2$Job_Paid_Work == 1, ]              # respondents in paid work only
+
+tools <- c("Transportation", "Safety", "Appearance", "PC", "Phone", "Internet", "Gifts", "Workspace")
+tsk   <- data.frame(ad = c("Waiting", "Communication", "Admin", "Travel", "Maintenance", "Networking", "PrepTime", "Training"),
+                    f  = c("Waiting_Tasks_Frequency", "Communication_Frequency", "Admin_Frequency", "Travel_Frequency",
+                           "Maintenance_Frequency", "Networking_Frequency", "PrepTime_Frequency", "Training_Frequency"),
+                    p  = c("Waiting_Tasks_Paid", "Communication_Paid", "Admin_Paid", "Travel_Paid",
+                           "Maintenance_Paid", "Networking_Paid", "Preptime_Paid", "Training_Paid"))
+need_v <- paste0("Tools_", tools); paid_v <- paste0("Tools_", tools, "_Paid")
+w <- w[stats::complete.cases(w[, c(need_v, tsk$f)]), ]                   # analysis sample: all filter questions answered
+write_out(as.data.frame(table(ulke = w$Country)), "step02_analiz_orneklemi.csv")
+
+RUN_STEP02 <- !file.exists("step02_lca_capraz_K3.csv")                  # skip if step02 outputs exist
+if (!RUN_STEP02) message("step02 ciktilari mevcut, atlandi.")
+
+# --- variables shared by step02/03 ---
+w$n_task_do   <- rowSums(sapply(tsk$f, function(v) w[[v]] >= 2))          # number of tasks performed
+w$n_task_un   <- rowSums(sapply(tsk$p, function(v) !is.na(w[[v]]) & w[[v]] >= 3))  # number of unpaid tasks
+w$n_tool_need <- rowSums(sapply(need_v, function(v) w[[v]] == 1))         # number of materials needed
+w$n_tool_un   <- rowSums(sapply(paid_v, function(v) !is.na(w[[v]]) & w[[v]] >= 3))  # number of unpaid materials
+w$any_task_un <- as.integer(w$n_task_un > 0); w$any_tool_un <- as.integer(w$n_tool_un > 0)
+w$sh_task <- ifelse(w$n_task_do > 0, w$n_task_un / w$n_task_do, NA)       # share of unpaid tasks
+w$sh_tool <- ifelse(w$n_tool_need > 0, w$n_tool_un / w$n_tool_need, NA)   # share of unpaid materials
+w$Occ <- factor(w$Occupation_SkillGroup); w$Ctry <- factor(w$Country)
+or2 <- function(a, b) { t <- table(factor(a, 0:1), factor(b, 0:1)); (t[2, 2] * t[1, 1]) / (t[2, 1] * t[1, 2]) }
+groups <- c(split(seq_len(nrow(w)), w$Country), list(Pooled = seq_len(nrow(w))))  # FR, UK, pooled
+
+if (RUN_STEP02) {
+# ---------- 2a. Prevalence: all workers (merged) vs exposed workers (conditional) ----------
+prev_one <- function(expo, paid, th, wt = NULL) {                       # expo: exposed; paid: code 1-4
+  u_all  <- ifelse(expo, paid >= th, FALSE)                              # merged: not exposed = paid
+  u_all[expo & is.na(paid)] <- NA                                        # exposed but unanswered -> NA
+  u_cond <- paid[expo] >= th                                             # conditional: exposed only
+  r <- c(N_tum = sum(!is.na(u_all)), N_maruz = sum(expo),
+         pct_tum = 100 * mean(u_all, na.rm = TRUE), pct_kosullu = 100 * mean(u_cond, na.rm = TRUE))
+  if (!is.null(wt)) {                                                    # UK weighted version
+    ok <- !is.na(u_all) & !is.na(wt); okc <- expo & !is.na(paid) & !is.na(wt)
+    r <- c(r, pct_tum_w = 100 * stats::weighted.mean(u_all[ok], wt[ok]),
+              pct_kosullu_w = 100 * stats::weighted.mean(paid[okc] >= th, wt[okc]))
+  } else r <- c(r, pct_tum_w = NA, pct_kosullu_w = NA)
+  r
+}
+prev <- list()
+for (g in names(groups)) {
+  gi <- groups[[g]]; wt <- if (g == "United Kingdom") w$Weight[gi] else NULL      # weights for UK only
+  for (th in c(2, 3)) {                                                  # 2: not fully paid; 3: mostly or entirely unpaid
+    for (k in seq_along(tools)) {
+      r <- prev_one(w[[need_v[k]]][gi] == 1, w[[paid_v[k]]][gi], th, wt)
+      prev[[length(prev) + 1]] <- data.frame(boyut = "malzeme", kalem = tools[k], grup = g, esik = th, t(r))
+    }
+    for (k in seq_len(nrow(tsk))) {
+      r <- prev_one(w[[tsk$f[k]]][gi] >= 2, w[[tsk$p[k]]][gi], th, wt)
+      prev[[length(prev) + 1]] <- data.frame(boyut = "gorev", kalem = tsk$ad[k], grup = g, esik = th, t(r))
+    }
+  }
+}
+prev <- do.call(rbind, prev)
+prev$oran_kosullu_tum <- round(prev$pct_kosullu / prev$pct_tum, 2)       # factor of underestimation
+num <- sapply(prev, is.numeric); prev[num] <- lapply(prev[num], round, 2)
+write_out(prev, "step02_kosullu_yayginlik.csv")
+
+# ---------- 2b. Task x material association: raw vs conditional on exposure ----------
+assoc <- do.call(rbind, lapply(names(groups), function(g) {
+  x <- w[groups[[g]], ]; ok <- !is.na(x$sh_task) & !is.na(x$sh_tool)
+  data.frame(grup = g, N = nrow(x),
+             OR_ham = or2(x$any_task_un, x$any_tool_un),                                  # merged co-occurrence
+             OR_maruziyet = or2(as.integer(x$n_task_do >= stats::median(x$n_task_do)),
+                                as.integer(x$n_tool_need >= stats::median(x$n_tool_need))),  # association of exposure itself
+             rho_ham_sayilar = stats::cor(x$n_task_un, x$n_tool_un, method = "spearman"),
+             rho_maruziyet   = stats::cor(x$n_task_do, x$n_tool_need, method = "spearman"),
+             rho_kosullu_pay = stats::cor(x$sh_task[ok], x$sh_tool[ok], method = "spearman"),
+             N_kosullu = sum(ok))
+}))
+num <- sapply(assoc, is.numeric); assoc[num] <- lapply(assoc[num], round, 3)
+write_out(assoc, "step02_birliktelik.csv")
+
+# logistic: unpaid material ~ unpaid task, controlling for exposure (Route A: glm; Route B: reduced glm)
+fA <- any_tool_un ~ any_task_un + n_task_do + n_tool_need + Ctry + Occ + Job_Employed
+fB <- any_tool_un ~ any_task_un + n_task_do + n_tool_need + Ctry
+m0 <- stats::glm(any_tool_un ~ any_task_un + Ctry, family = binomial, data = w)          # without exposure
+m1 <- tryCatch(stats::glm(fA, family = binomial, data = w), error = function(e) NULL)    # Route A
+if (is.null(m1)) m1 <- stats::glm(fB, family = binomial, data = w)                        # Route B
+tidy <- function(m, lab) { s <- summary(m)$coefficients
+  data.frame(model = lab, terim = rownames(s), b = s[, 1], se = s[, 2], OR = exp(s[, 1]),
+             OR_lo = exp(s[, 1] - 1.96 * s[, 2]), OR_hi = exp(s[, 1] + 1.96 * s[, 2]), p = s[, 4], N = stats::nobs(m)) }
+lg <- rbind(tidy(m0, "M0_maruziyetsiz"), tidy(m1, "M1_maruziyet_kontrollu"))
+num <- sapply(lg, is.numeric); lg[num] <- lapply(lg[num], signif, 4)
+write_out(lg, "step02_lojistik.csv")
+
+}  # end of step02 2a-2b
+
+# ---------- 2c. LCA: merged coding (M) vs conditional coding (C) ----------
+YM <- sapply(seq_along(tools), function(k) {                             # M: 1 = paid or not needed, 2 = partly or not paid
+  nd <- w[[need_v[k]]]; p <- w[[paid_v[k]]]
+  ifelse(nd == 0, 1, ifelse(is.na(p), NA, ifelse(p >= 2, 2, 1))) })
+colnames(YM) <- paste0("M_", tools)
+YC <- cbind(sapply(need_v, function(v) w[[v]] + 1),                      # C: need item (1 no, 2 yes)
+            sapply(seq_along(tools), function(k) {                       # + payment item only if needed
+              nd <- w[[need_v[k]]]; p <- w[[paid_v[k]]]
+              ifelse(nd == 1 & !is.na(p), ifelse(p >= 2, 2, 1), NA) }))
+colnames(YC) <- c(paste0("N_", tools), paste0("C_", tools))
+YM7 <- YM[, colnames(YM) != "M_Safety"]                                  # coding of the technical report: safety equipment excluded
+
+entropy <- function(post) { K <- ncol(post); if (K == 1) return(NA)
+  p <- pmax(post, 1e-12); 1 - sum(-p * log(p)) / (nrow(post) * log(K)) }
+
+lca_em <- function(Y, K, nrep = 10, maxit = 3000, tol = 1e-7) {          # Route B: own EM (handles NA)
+  Y <- as.matrix(Y); N <- nrow(Y); J <- ncol(Y); R <- apply(Y, 2, max, na.rm = TRUE)
+  best <- NULL
+  for (r in seq_len(nrep)) {
+    set.seed(1000 + r)
+    pi <- rep(1 / K, K)
+    th <- lapply(seq_len(J), function(j) { m <- matrix(stats::runif(K * R[j]), K, R[j]); m / rowSums(m) })
+    ll_old <- -Inf
+    for (it in seq_len(maxit)) {
+      lp <- matrix(log(pi), N, K, byrow = TRUE)                          # log P(class)
+      for (j in seq_len(J)) { y <- Y[, j]; ok <- !is.na(y)
+        lp[ok, ] <- lp[ok, ] + t(log(th[[j]][, y[ok], drop = FALSE])) }  # contribution of observed items
+      mx <- apply(lp, 1, max); ll <- sum(mx + log(rowSums(exp(lp - mx))))
+      post <- exp(lp - mx); post <- post / rowSums(post)                 # E step
+      pi <- colMeans(post)                                               # M step: class shares
+      for (j in seq_len(J)) { y <- Y[, j]; ok <- !is.na(y)
+        m <- sapply(seq_len(R[j]), function(cc) colSums(post[ok & y == cc, , drop = FALSE]))
+        m <- matrix(m, K, R[j]) + 1e-10; th[[j]] <- m / rowSums(m) }     # M step: item probabilities
+      if (abs(ll - ll_old) < tol) break; ll_old <- ll
+    }
+    if (is.null(best) || ll > best$ll) best <- list(ll = ll, P = pi, th = th, post = post)
+  }
+  npar <- (K - 1) + K * sum(R - 1)
+  best$bic <- -2 * best$ll + log(N) * npar; best$aic <- -2 * best$ll + 2 * npar; best$npar <- npar
+  best$yol <- "B_kendiEM"; best
+}
+run_lca <- function(Y, K, nrep = 10) {                                              # Route A: poLCA; otherwise Route B
+  df <- as.data.frame(Y); f <- stats::as.formula(paste0("cbind(", paste(names(df), collapse = ","), ") ~ 1"))
+  fit <- tryCatch(suppressWarnings(poLCA::poLCA(f, df, nclass = K, nrep = nrep, maxiter = 3000,
+                                                na.rm = FALSE, verbose = FALSE, calc.se = FALSE)),
+                  error = function(e) NULL)
+  if (!is.null(fit) && nrow(fit$posterior) == nrow(df))
+    return(list(ll = fit$llik, P = fit$P, th = fit$probs, post = fit$posterior,
+                bic = fit$bic, aic = fit$aic, npar = fit$npar, yol = "A_poLCA"))
+  lca_em(Y, K, nrep = nrep)
+}
+
+ari <- function(a, b) {                                                  # adjusted Rand index
+  t <- table(a, b); n <- sum(t); s <- function(x) sum(choose(x, 2))
+  e <- s(rowSums(t)) * s(colSums(t)) / choose(n, 2)
+  (s(t) - e) / ((s(rowSums(t)) + s(colSums(t))) / 2 - e) }
+
+if (RUN_STEP02) {
+fits <- list(); fitstat <- list()
+for (cod in c("M8", "M7", "C")) {
+  Y <- switch(cod, M8 = YM, M7 = YM7, C = YC)
+  for (K in 1:5) {
+    ft <- run_lca(Y, K); fits[[paste(cod, K)]] <- ft
+    fitstat[[length(fitstat) + 1]] <- data.frame(kodlama = cod, K = K, yol = ft$yol, LL = ft$ll, npar = ft$npar,
+                                                 BIC = ft$bic, AIC = ft$aic, entropi = entropy(ft$post),
+                                                 en_kucuk_sinif = min(ft$P), N = nrow(ft$post))
+  }
+}
+fitstat <- do.call(rbind, fitstat)
+num <- sapply(fitstat, is.numeric); fitstat[num] <- lapply(fitstat[num], round, 4)
+write_out(fitstat, "step02_lca_uyum.csv")
+
+# profiles (K = 3, as in the technical report): probability of "not paid" in each class
+prof <- list()
+for (cod in c("M8", "C")) {
+  ft <- fits[[paste(cod, 3)]]; Y <- switch(cod, M8 = YM, C = YC)
+  for (j in seq_along(ft$th)) {
+    m <- as.matrix(ft$th[[j]])
+    prof[[length(prof) + 1]] <- data.frame(kodlama = cod, madde = colnames(Y)[j], sinif = seq_len(nrow(m)),
+                                           sinif_payi = round(ft$P, 4), P_kat2 = round(m[, ncol(m)], 4))
+  }
+}
+write_out(do.call(rbind, prof), "step02_lca_profil_K3.csv")
+
+# agreement of M and C classifications (modal-class cross-table, K = 3)
+cM <- max.col(fits[["M8 3"]]$post); cC <- max.col(fits[["C 3"]]$post)
+xt <- as.data.frame(table(M8_sinif = cM, C_sinif = cC))
+xt$ARI <- round(ari(cM, cC), 4)
+write_out(xt, "step02_lca_capraz_K3.csv")
+}  # end of step02
+
+# =====================================================================
+# STEP03 - robustness: employees, K = 1-8, profile of the hidden class,
+#          local independence, threshold sensitivity, Monte Carlo
+# =====================================================================
+NREP3 <- 10                                                              # number of LCA starts
+MC_R  <- 50                                                              # Monte Carlo replicates per scenario
+
+# helpers: coding matrices (selectable threshold) and detection of the "hidden" class
+make_YM <- function(d, th) sapply(seq_along(tools), function(k) {        # merged coding
+  nd <- d[[need_v[k]]]; p <- d[[paid_v[k]]]
+  ifelse(nd == 0, 1, ifelse(is.na(p), NA, ifelse(p >= th, 2, 1))) })
+make_YC <- function(d, th) {                                             # conditional coding
+  Y <- cbind(sapply(need_v, function(v) d[[v]] + 1),
+             sapply(seq_along(tools), function(k) {
+               nd <- d[[need_v[k]]]; p <- d[[paid_v[k]]]
+               ifelse(nd == 1 & !is.na(p), ifelse(p >= th, 2, 1), NA) }))
+  colnames(Y) <- c(paste0("N_", tools), paste0("C_", tools)); Y }
+pk2 <- function(ft, j) { m <- as.matrix(ft$th[[j]]); m[, ncol(m)] }      # probability of category 2 in each class
+hidden_id <- function(ft) which.min(pk2(ft, which(tools == "PC")))      # class with the lowest computer need
+hidden_row <- function(ft, lab) {                                        # summary of the hidden class
+  h <- hidden_id(ft); J <- length(tools)
+  data.frame(model = lab, K = length(ft$P), sinif_payi = ft$P[h],
+             N_PC = pk2(ft, which(tools == "PC"))[h], N_Safety = pk2(ft, which(tools == "Safety"))[h],
+             N_Appearance = pk2(ft, which(tools == "Appearance"))[h],
+             C_Safety = pk2(ft, J + which(tools == "Safety"))[h],
+             C_Appearance = pk2(ft, J + which(tools == "Appearance"))[h],
+             C_Transportation = pk2(ft, J + which(tools == "Transportation"))[h]) }
+
+RUN_STEP03 <- !file.exists("step03_montecarlo.csv")                     # skip if step03 outputs exist
+if (!RUN_STEP03) message("step03 ciktilari mevcut, atlandi.")
+if (RUN_STEP03) {
+
+# ---------- 3a. Employees only (self-employed excluded) ----------
+we <- w[!is.na(w$Job_Employed) & w$Job_Employed == 1, ]
+mE  <- stats::glm(any_tool_un ~ any_task_un + n_task_do + n_tool_need + Ctry + Occ, family = binomial, data = we)
+ce  <- summary(mE)$coefficients["any_task_un", ]
+okE <- !is.na(we$sh_task) & !is.na(we$sh_tool)
+fCE <- run_lca(make_YC(we, 2), 3, NREP3); fME <- run_lca(make_YM(we, 2), 3, NREP3)
+hE  <- hidden_row(fCE, "ucretli_C_K3")
+sens <- data.frame(
+  olcu  = c("N", "OR_ham", "OR_maruziyet_kontrollu", "OR_lo", "OR_hi", "rho_kosullu_pay",
+            "ARI_M_vs_C_K3", "gizli_sinif_payi", "gizli_C_Safety", "gizli_C_Appearance"),
+  deger = c(nrow(we), or2(we$any_task_un, we$any_tool_un), exp(ce[1]), exp(ce[1] - 1.96 * ce[2]),
+            exp(ce[1] + 1.96 * ce[2]), stats::cor(we$sh_task[okE], we$sh_tool[okE], method = "spearman"),
+            ari(max.col(fME$post), max.col(fCE$post)), hE$sinif_payi, hE$C_Safety, hE$C_Appearance))
+sens$deger <- round(sens$deger, 4)
+write_out(sens, "step03_ucretli_duyarlilik.csv")
+
+# ---------- 3b. Number of classes K = 1-8 (conditional coding, full sample) ----------
+YC2 <- make_YC(w, 2); fitsK <- list(); kst <- list(); hid <- list()
+for (K in 1:8) {
+  ft <- run_lca(YC2, K, NREP3); fitsK[[K]] <- ft
+  kst[[K]] <- data.frame(K = K, yol = ft$yol, LL = ft$ll, npar = ft$npar, BIC = ft$bic, AIC = ft$aic,
+                         entropi = entropy(ft$post), en_kucuk_sinif = min(ft$P))
+  if (K >= 2) hid[[K]] <- hidden_row(ft, "C_tum")
+}
+kst <- do.call(rbind, kst); kst$dBIC <- c(NA, diff(kst$BIC))             # BIC improvement
+num <- sapply(kst, is.numeric); kst[num] <- lapply(kst[num], round, 4)
+write_out(kst, "step03_lca_uyum_K1_8.csv")
+hid <- do.call(rbind, hid); num <- sapply(hid, is.numeric); hid[num] <- lapply(hid[num], round, 4)
+write_out(hid, "step03_gizli_sinif_K.csv")                              # is the hidden class present at each K?
+
+# ---------- 3c. Profile of the hidden class (K = 3, posterior-weighted and modal) ----------
+f3 <- fitsK[[3]]; h <- hidden_id(f3); ph <- f3$post[, h]                # probability of membership in the hidden class
+modal_h <- max.col(f3$post) == h
+prof_vars <- c("ISCO_1D", "Occupation_SkillGroup", "Gender", "Employment_Contract", "Job_Employed",
+               "Job_HSRisk", "Country", "Age_Groups", "Education_3Lvl")
+prof_vars <- prof_vars[prof_vars %in% names(w)]
+gp <- do.call(rbind, lapply(prof_vars, function(v) {
+  x <- as.character(w[[v]]); x[is.na(x)] <- "NA"
+  do.call(rbind, lapply(sort(unique(x)), function(cat) {
+    in_c <- x == cat
+    data.frame(degisken = v, kategori = cat, N = sum(in_c),
+               pct_gizli_posterior = 100 * sum(ph[in_c]) / sum(ph),          # composition of the hidden class
+               pct_diger_posterior = 100 * sum((1 - ph)[in_c]) / sum(1 - ph), # composition of the other classes
+               pct_gizli_modal = 100 * mean(in_c[modal_h]),
+               gizli_olasiligi_kategoride = mean(ph[in_c]))                   # share of the hidden class within each category
+  }))
+}))
+num <- sapply(gp, is.numeric); gp[num] <- lapply(gp[num], round, 3)
+write_out(gp, "step03_gizli_sinif_profil.csv")
+
+# ---------- 3d. Local independence: bivariate residuals (approximate BVR), K = 3 ----------
+bvr <- list(); J2 <- ncol(YC2)
+for (a in 1:(J2 - 1)) for (b in (a + 1):J2) {
+  ok <- !is.na(YC2[, a]) & !is.na(YC2[, b]); if (sum(ok) < 30) next
+  if (sub("^._", "", colnames(YC2)[a]) == sub("^._", "", colnames(YC2)[b])) next  # N_/C_ pair of the same item is structurally dependent
+  O <- table(factor(YC2[ok, a], 1:2), factor(YC2[ok, b], 1:2))
+  pw <- colMeans(f3$post[ok, , drop = FALSE])                          # class shares in this subgroup
+  E <- matrix(0, 2, 2)
+  for (k in seq_along(pw)) E <- E + pw[k] * outer(as.matrix(f3$th[[a]])[k, ], as.matrix(f3$th[[b]])[k, ])
+  E <- E * sum(ok)
+  bvr[[length(bvr) + 1]] <- data.frame(madde1 = colnames(YC2)[a], madde2 = colnames(YC2)[b], n = sum(ok),
+                                       BVR = sum((O - E)^2 / pmax(E, 1e-8)) / 1)  # Pearson X2 (df = 1)
+}
+bvr <- do.call(rbind, bvr); bvr <- bvr[order(-bvr$BVR), ]; bvr$BVR <- round(bvr$BVR, 2)
+bvr$asim_3_84 <- bvr$BVR > 3.84                                          # approximate 5% critical value
+write_out(bvr, "step03_bvr_K3.csv")
+
+# ---------- 3e. Threshold sensitivity: "mostly/entirely unpaid" (>= 3) ----------
+fC3 <- run_lca(make_YC(w, 3), 3, NREP3); fM3 <- run_lca(make_YM(w, 3), 3, NREP3)
+h3 <- hidden_row(fC3, "C_K3_esik3")
+th_sens <- rbind(cbind(esik = 2, hid[hid$K == 3, ]), cbind(esik = 3, h3))
+th_sens$ARI_M_vs_C <- c(ari(max.col(fitsK[[3]]$post), max.col(run_lca(make_YM(w, 2), 3, NREP3)$post)),
+                        ari(max.col(fM3$post), max.col(fC3$post)))
+num <- sapply(th_sens, is.numeric); th_sens[num] <- lapply(th_sens[num], round, 4)
+write_out(th_sens, "step03_esik_duyarlilik.csv")
+
+# ---------- 3f. Monte Carlo: does merged coding recover the gradient? ----------
+# True structure: need profile (digital / manual) and compensation class (generous / cost-shifting).
+# Cost-shifting probability may depend on the profile (p_dig, p_man). Target: manual minus digital.
+sim_one <- function(N, p_manual, p_dig, p_man, need_dig, need_man, un_gen, un_shift) {
+  man <- stats::rbinom(N, 1, p_manual)                                             # true need profile
+  sh  <- stats::rbinom(N, 1, ifelse(man == 1, p_man, p_dig))                       # true compensation class
+  pn  <- t(sapply(man, function(m) if (m == 1) need_man else need_dig))            # need probabilities
+  nd  <- matrix(stats::rbinom(N * 8, 1, pn), N, 8)                                  # item needed?
+  un  <- matrix(stats::rbinom(N * 8, 1, ifelse(sh == 1, un_shift, un_gen)), N, 8)  # not paid?
+  YMs <- ifelse(nd == 0, 1, un + 1)                                                  # merged
+  YCs <- cbind(nd + 1, ifelse(nd == 1, un + 1, NA))                                   # conditional
+  colnames(YMs) <- paste0("M", 1:8); colnames(YCs) <- c(paste0("N", 1:8), paste0("C", 1:8))
+  list(man = man, sh = sh, YM = YMs, YC = YCs) }
+shift_post <- function(ft, items) {                                      # probability of membership in cost-shifting classes
+  pm <- sapply(seq_len(length(ft$P)), function(k) mean(sapply(items, function(j) as.matrix(ft$th[[j]])[k, 2])))
+  rowSums(ft$post[, pm > (min(pm) + max(pm)) / 2, drop = FALSE]) }      # classes above the midpoint between lowest and highest
+need_dig <- c(.45, .20, .45, .95, .80, .97, .08, .88)                    # digital profile close to the observed data
+need_man <- c(.40, .55, .60, .12, .35, .25, .03, .35)                    # manual profile close to the observed data
+scen <- data.frame(senaryo = c("S1_bagimsiz", "S2_bagimli", "S3_bagimli_guclu", "S4_bagimli_el_emegi_az"),
+                   p_manual = c(.30, .30, .30, .15), p_dig = c(.25, .15, .10, .15), p_man = c(.25, .50, .70, .50),
+                   un_gen = .05, un_shift = .45)
+mc <- list()
+for (s in seq_len(nrow(scen))) for (r in seq_len(MC_R)) {
+  set.seed(5000 + 100 * s + r)
+  sm <- sim_one(2952, scen$p_manual[s], scen$p_dig[s], scen$p_man[s], need_dig, need_man, scen$un_gen[s], scen$un_shift[s])
+  fM <- run_lca(sm$YM, 2, 3); fC <- run_lca(sm$YC, 4, 3)                 # M: 2 classes, C: 2 x 2 = 4 classes
+  sM <- shift_post(fM, 1:8); sC <- shift_post(fC, 9:16)
+  gap <- function(p) mean(p[sm$man == 1]) - mean(p[sm$man == 0])        # manual minus digital
+  mc[[length(mc) + 1]] <- data.frame(senaryo = scen$senaryo[s], tekrar = r,
+    gradyan_gercek = gap(sm$sh), gradyan_M = gap(sM), gradyan_C = gap(sC),
+    ARI_M_karsilama = ari(max.col(fM$post), sm$sh), ARI_C_ortak = ari(max.col(fC$post), 2 * sm$sh + sm$man))
+}
+mc <- do.call(rbind, mc)
+mc$yanlilik_M <- mc$gradyan_M - mc$gradyan_gercek; mc$yanlilik_C <- mc$gradyan_C - mc$gradyan_gercek
+mcs <- stats::aggregate(. ~ senaryo, data = mc[, -2], FUN = function(x) round(mean(x), 3))
+mcs$MC_R <- MC_R
+write_out(mc,  "step03_montecarlo_tekrarlar.csv")
+write_out(mcs, "step03_montecarlo.csv")
+
+}  # end of step03
+
+
+# =====================================================================
+# STEP04 - two-dimensional (factorial) LCA: need dimension (A) x compensation dimension (B)
+#   Route A: two-dimensional EM (need items depend on A only, payment items on B only)
+#   Route B: standard LCA, K = 5-6 (comparison)
+# =====================================================================
+NREP4    <- 10                                                           # observed data: number of starts
+NREP4_MC <- 5                                                            # Monte Carlo: number of starts
+MC_R4    <- 50                                                           # Monte Carlo: replicates per scenario
+
+# ---------- two-dimensional EM ----------
+lca2d_em <- function(Y, idxA, idxB, Ka, Kb, nrep = 10, maxit = 3000, tol = 1e-7, seed0 = 2000, init = NULL) {
+  Y <- as.matrix(Y); N <- nrow(Y); R <- apply(Y, 2, max, na.rm = TRUE)
+  C <- Ka * Kb; aOf <- rep(seq_len(Ka), times = Kb); bOf <- rep(seq_len(Kb), each = Ka)  # cell -> (a, b)
+  upd <- function(pp, idx, K) lapply(idx, function(j) {                  # M step: item probabilities
+    y <- Y[, j]; ok <- !is.na(y)
+    m <- sapply(seq_len(R[j]), function(cc) colSums(pp[ok & y == cc, , drop = FALSE]))
+    m <- matrix(m, K, R[j]) + 1e-10; m / rowSums(m) })
+  best <- NULL
+  for (r in seq_len(nrep)) {
+    set.seed(seed0 + r)
+    pc  <- rep(1 / C, C)                                                 # joint cell probabilities
+    thA <- lapply(idxA, function(j) { m <- matrix(stats::runif(Ka * R[j]), Ka, R[j]); m / rowSums(m) })
+    thB <- lapply(idxB, function(j) { m <- matrix(stats::runif(Kb * R[j]), Kb, R[j]); m / rowSums(m) })
+    if (r == 1 && !is.null(init)) { pc <- init$P; thA <- init$thA; thB <- init$thB }  # user-supplied start values (for bootstrap)
+    ll_old <- -Inf
+    for (it in seq_len(maxit)) {
+      LA <- matrix(0, N, Ka); LB <- matrix(0, N, Kb)                      # log-likelihood by dimension
+      for (q in seq_along(idxA)) { y <- Y[, idxA[q]]; ok <- !is.na(y)
+        LA[ok, ] <- LA[ok, ] + t(log(thA[[q]][, y[ok], drop = FALSE])) }
+      for (q in seq_along(idxB)) { y <- Y[, idxB[q]]; ok <- !is.na(y)
+        LB[ok, ] <- LB[ok, ] + t(log(thB[[q]][, y[ok], drop = FALSE])) }
+      lp <- LA[, aOf, drop = FALSE] + LB[, bOf, drop = FALSE] + matrix(log(pc), N, C, byrow = TRUE)
+      mx <- apply(lp, 1, max); ll <- sum(mx + log(rowSums(exp(lp - mx))))
+      post <- exp(lp - mx); post <- post / rowSums(post)                 # E step
+      pc <- colMeans(post)
+      pA <- matrix(sapply(seq_len(Ka), function(a) rowSums(post[, aOf == a, drop = FALSE])), N, Ka)
+      pB <- matrix(sapply(seq_len(Kb), function(b) rowSums(post[, bOf == b, drop = FALSE])), N, Kb)
+      thA <- upd(pA, idxA, Ka); thB <- upd(pB, idxB, Kb)
+      if (abs(ll - ll_old) < tol) break; ll_old <- ll
+    }
+    if (is.null(best) || ll > best$ll) best <- list(ll = ll, P = pc, post = post, thA = thA, thB = thB)
+  }
+  npar <- (C - 1) + Ka * sum(R[idxA] - 1) + Kb * sum(R[idxB] - 1)
+  best$npar <- npar; best$bic <- -2 * best$ll + log(N) * npar; best$aic <- -2 * best$ll + 2 * npar
+  best$Ka <- Ka; best$Kb <- Kb; best$aOf <- aOf; best$bOf <- bOf; best$idxA <- idxA; best$idxB <- idxB
+  thc <- vector("list", ncol(Y))                                          # item probabilities by cell
+  for (q in seq_along(idxA)) thc[[idxA[q]]] <- best$thA[[q]][aOf, , drop = FALSE]
+  for (q in seq_along(idxB)) thc[[idxB[q]]] <- best$thB[[q]][bOf, , drop = FALSE]
+  best$th <- thc; best$yol <- "A_2boyutluEM"; best
+}
+
+# ---------- bivariate residuals (BVR): standard and two-dimensional models ----------
+bvr_fun <- function(Y, ft) {
+  out <- list(); J <- ncol(Y)
+  for (a in 1:(J - 1)) for (b in (a + 1):J) {
+    ok <- !is.na(Y[, a]) & !is.na(Y[, b]); if (sum(ok) < 30) next
+    if (sub("^._", "", colnames(Y)[a]) == sub("^._", "", colnames(Y)[b])) next   # N_/C_ pair of the same item
+    O  <- table(factor(Y[ok, a], 1:2), factor(Y[ok, b], 1:2))
+    pw <- colMeans(ft$post[ok, , drop = FALSE]); E <- matrix(0, 2, 2)
+    for (k in seq_along(pw)) E <- E + pw[k] * outer(as.matrix(ft$th[[a]])[k, ], as.matrix(ft$th[[b]])[k, ])
+    E <- E * sum(ok)
+    out[[length(out) + 1]] <- data.frame(madde1 = colnames(Y)[a], madde2 = colnames(Y)[b], n = sum(ok),
+                                         BVR = sum((O - E)^2 / pmax(E, 1e-8)))
+  }
+  out <- do.call(rbind, out); out[order(-out$BVR), ]
+}
+bvr_sum <- function(b) c(n_cift = nrow(b), n_asim = sum(b$BVR > 3.84), maks_BVR = max(b$BVR), top_BVR = sum(b$BVR))
+
+# ---------- Monte Carlo helpers (defined even if step03 is skipped) ----------
+need_dig4 <- c(.45, .20, .45, .95, .80, .97, .08, .88)                   # digital need profile
+need_man4 <- c(.40, .55, .60, .12, .35, .25, .03, .35)                   # manual need profile
+sim4 <- function(N, p_manual, p_dig, p_man, un_gen, un_shift) {
+  man <- stats::rbinom(N, 1, p_manual)                                   # true need profile
+  sh  <- stats::rbinom(N, 1, ifelse(man == 1, p_man, p_dig))             # true compensation class
+  pn  <- t(sapply(man, function(m) if (m == 1) need_man4 else need_dig4))
+  nd  <- matrix(stats::rbinom(N * 8, 1, pn), N, 8)
+  un  <- matrix(stats::rbinom(N * 8, 1, ifelse(sh == 1, un_shift, un_gen)), N, 8)
+  YMs <- ifelse(nd == 0, 1, un + 1); YCs <- cbind(nd + 1, ifelse(nd == 1, un + 1, NA))
+  colnames(YMs) <- paste0("M", 1:8); colnames(YCs) <- c(paste0("N", 1:8), paste0("C", 1:8))
+  list(man = man, sh = sh, YM = YMs, YC = YCs) }
+shift_post4 <- function(ft, items) {                                     # standard LCA: cost-shifting classes
+  pm <- sapply(seq_len(length(ft$P)), function(k) mean(sapply(items, function(j) as.matrix(ft$th[[j]])[k, 2])))
+  rowSums(ft$post[, pm > (min(pm) + max(pm)) / 2, drop = FALSE]) }
+shift_b <- function(f2) which.max(sapply(seq_len(f2$Kb), function(b)     # 2D: cost-shifting B class
+  mean(sapply(f2$thB, function(m) m[b, ncol(m)]))))
+
+scen4 <- data.frame(senaryo = c("S1_bagimsiz", "S2_bagimli", "S3_bagimli_guclu", "S4_bagimli_el_emegi_az"),
+                    p_manual = c(.30, .30, .30, .15), p_dig = c(.25, .15, .10, .15), p_man = c(.25, .50, .70, .50),
+                    un_gen = .05, un_shift = .45)
+
+# =====================================================================
+# 4a-4d. Observed data
+# =====================================================================
+RUN_4R <- !file.exists("step04_2d_gradyan.csv")                         # skip if the observed-data part exists
+if (!RUN_4R) message("step04 gercek veri ciktilari mevcut, atlandi.")
+if (RUN_4R) {
+  YC2 <- make_YC(w, 2); iA <- 1:8; iB <- 9:16                             # A: need items, B: payment items
+
+  # 4a. Model comparison: 2D (Ka = 2-4, Kb = 2-3) and standard (K = 5-6)
+  fits4 <- list(); fs <- list()
+  for (Ka in 2:4) for (Kb in 2:3) {
+    f2 <- tryCatch(lca2d_em(YC2, iA, iB, Ka, Kb, nrep = NREP4), error = function(e) NULL)
+    if (is.null(f2)) next
+    nm <- paste0("2B_A", Ka, "_B", Kb); fits4[[nm]] <- f2; bs <- bvr_sum(bvr_fun(YC2, f2))
+    fs[[nm]] <- data.frame(model = nm, aile = "2B", Ka = Ka, Kb = Kb, LL = f2$ll, npar = f2$npar,
+                           BIC = f2$bic, AIC = f2$aic, entropi = entropy(f2$post), en_kucuk_hucre = min(f2$P), t(bs))
+  }
+  for (K in 5:6) {                                                       # Route B: standard LCA
+    fk <- run_lca(YC2, K, NREP4); nm <- paste0("Klasik_K", K); fits4[[nm]] <- fk; bs <- bvr_sum(bvr_fun(YC2, fk))
+    fs[[nm]] <- data.frame(model = nm, aile = paste0("Klasik_", fk$yol), Ka = K, Kb = NA, LL = fk$ll, npar = fk$npar,
+                           BIC = fk$bic, AIC = fk$aic, entropi = entropy(fk$post), en_kucuk_hucre = min(fk$P), t(bs))
+  }
+  fs <- do.call(rbind, fs); num <- sapply(fs, is.numeric); fs[num] <- lapply(fs[num], round, 3)
+  write_out(fs, "step04_2d_uyum.csv")
+
+  # best 2D model (BIC)
+  f2s <- fs[fs$aile == "2B", ]
+  if (nrow(f2s) == 0) stop("2B model kurulamadi.")
+  bn <- f2s$model[which.min(f2s$BIC)]; fb <- fits4[[bn]]
+  write_out(cbind(model = bn, bvr_fun(YC2, fb)), "step04_bvr_2d_best.csv")
+
+  # 4b. Profiles: need probabilities in A classes, unpaid probabilities in B classes
+  pA_marg <- sapply(seq_len(fb$Ka), function(a) sum(fb$P[fb$aOf == a]))
+  pB_marg <- sapply(seq_len(fb$Kb), function(b) sum(fb$P[fb$bOf == b]))
+  prA <- do.call(rbind, lapply(seq_along(iA), function(q) data.frame(boyut = "A_ihtiyac", madde = colnames(YC2)[iA[q]],
+           sinif = seq_len(fb$Ka), sinif_payi = pA_marg, P_evet = fb$thA[[q]][, 2])))
+  prB <- do.call(rbind, lapply(seq_along(iB), function(q) data.frame(boyut = "B_karsilama", madde = colnames(YC2)[iB[q]],
+           sinif = seq_len(fb$Kb), sinif_payi = pB_marg, P_evet = fb$thB[[q]][, 2])))
+  pr <- rbind(prA, prB); pr$model <- bn; num <- sapply(pr, is.numeric); pr[num] <- lapply(pr[num], round, 4)
+  write_out(pr, "step04_2d_profil.csv")
+
+  # 4c. Joint distribution and gradient: P(cost-shifting | need class)
+  bs_id <- shift_b(fb); pcA <- which(colnames(YC2)[iA] == "N_PC")
+  pPC <- fb$thA[[pcA]][, 2]; a_man <- which.min(pPC); a_dig <- which.max(pPC)
+  grd <- do.call(rbind, lapply(seq_len(fb$Ka), function(a) data.frame(model = bn, A_sinif = a,
+           A_payi = pA_marg[a], P_ihtiyac_PC = pPC[a],
+           P_ihtiyac_Safety = fb$thA[[which(colnames(YC2)[iA] == "N_Safety")]][a, 2],
+           P_aktaran_given_A = sum(fb$P[fb$aOf == a & fb$bOf == bs_id]) / pA_marg[a],
+           el_emegi = a == a_man, dijital = a == a_dig)))
+  grd$gradyan_el_eksi_dijital <- grd$P_aktaran_given_A[a_man] - grd$P_aktaran_given_A[a_dig]
+  # fast uncertainty from posterior draws (200 replicates) instead of nonparametric bootstrap
+  set.seed(77); cellmat <- fb$post
+  bt <- replicate(200, {
+    z <- apply(cellmat, 1, function(p) sample.int(length(p), 1, prob = p))   # draw a cell for each person
+    a <- fb$aOf[z]; b <- fb$bOf[z]
+    mean(b[a == a_man] == bs_id) - mean(b[a == a_dig] == bs_id) })
+  grd$gradyan_lo <- stats::quantile(bt, .025); grd$gradyan_hi <- stats::quantile(bt, .975)
+  num <- sapply(grd, is.numeric); grd[num] <- lapply(grd[num], round, 4)
+
+  # 4d. ISCO composition of classes (posterior-weighted)
+  pA <- matrix(sapply(seq_len(fb$Ka), function(a) rowSums(fb$post[, fb$aOf == a, drop = FALSE])), nrow(w), fb$Ka)
+  pBs <- rowSums(fb$post[, fb$bOf == bs_id, drop = FALSE])
+  isc <- as.character(w$ISCO_1D); isc[is.na(isc)] <- "NA"
+  comp <- do.call(rbind, lapply(sort(unique(isc)), function(cat) {
+    i <- isc == cat
+    data.frame(ISCO_1D = cat, N = sum(i), t(setNames(100 * colSums(pA[i, , drop = FALSE]) / colSums(pA),
+                                                    paste0("pct_A", seq_len(fb$Ka)))),
+               pct_aktaran = 100 * sum(pBs[i]) / sum(pBs), pct_diger = 100 * sum(1 - pBs[i]) / sum(1 - pBs),
+               P_aktaran_kategoride = mean(pBs[i])) }))
+  num <- sapply(comp, is.numeric); comp[num] <- lapply(comp[num], round, 3)
+  write_out(comp, "step04_2d_isco.csv")
+  write_out(grd, "step04_2d_gradyan.csv")
+}
+
+# =====================================================================
+# 4e. Monte Carlo: M (standard, K = 2), C (standard, K = 4), C-2D (Ka = 2, Kb = 2)
+# =====================================================================
+RUN_4MC <- !file.exists("step04_montecarlo.csv")
+if (!RUN_4MC) message("step04 Monte Carlo ciktilari mevcut, atlandi.")
+if (RUN_4MC) {
+  mc4 <- list()
+  for (s in seq_len(nrow(scen4))) for (r in seq_len(MC_R4)) {
+    set.seed(9000 + 100 * s + r)
+    sm  <- sim4(2952, scen4$p_manual[s], scen4$p_dig[s], scen4$p_man[s], scen4$un_gen[s], scen4$un_shift[s])
+    gap <- function(p) mean(p[sm$man == 1]) - mean(p[sm$man == 0])      # manual minus digital
+    fM <- run_lca(sm$YM, 2, NREP4_MC); fC <- run_lca(sm$YC, 4, NREP4_MC)
+    f2 <- tryCatch(lca2d_em(sm$YC, 1:8, 9:16, 2, 2, nrep = NREP4_MC, maxit = 1500, tol = 1e-6),
+                   error = function(e) NULL)
+    g2 <- g2m <- NA
+    if (!is.null(f2)) {
+      b2 <- shift_b(f2); pBs2 <- rowSums(f2$post[, f2$bOf == b2, drop = FALSE])
+      g2 <- gap(pBs2)                                                     # person-based estimate
+      pPC2 <- f2$thA[[4]][, 2]; am <- which.min(pPC2); ad <- which.max(pPC2)
+      pa <- sapply(1:2, function(a) sum(f2$P[f2$aOf == a]))
+      g2m <- sum(f2$P[f2$aOf == am & f2$bOf == b2]) / pa[am] - sum(f2$P[f2$aOf == ad & f2$bOf == b2]) / pa[ad]  # model-based
+    }
+    mc4[[length(mc4) + 1]] <- data.frame(senaryo = scen4$senaryo[s], tekrar = r, gercek = gap(sm$sh),
+      M = gap(shift_post4(fM, 1:8)), C = gap(shift_post4(fC, 9:16)), C2B_kisi = g2, C2B_model = g2m)
+  }
+  mc4 <- do.call(rbind, mc4)
+  write_out(mc4, "step04_montecarlo_tekrarlar.csv")
+  long <- do.call(rbind, lapply(c("M", "C", "C2B_kisi", "C2B_model"), function(m) {
+    do.call(rbind, lapply(split(mc4, mc4$senaryo), function(d) {
+      e <- d[[m]] - d$gercek; e <- e[!is.na(e)]
+      data.frame(senaryo = d$senaryo[1], yontem = m, gercek = mean(d$gercek), ort_tahmin = mean(d[[m]], na.rm = TRUE),
+                 ort_yanlilik = mean(e), medyan_yanlilik = stats::median(e), sd = stats::sd(d[[m]], na.rm = TRUE),
+                 RMSE = sqrt(mean(e^2)), basarisiz_pct = 100 * mean(abs(e) > 0.25), n = length(e)) })) }))
+  num <- sapply(long, is.numeric); long[num] <- lapply(long[num], round, 3)
+  long$MC_R <- MC_R4
+  write_out(long, "step04_montecarlo.csv")
+}
+
+
+# =====================================================================
+# STEP05 - further checks of the two-dimensional model
+#   5a. model scan (need 2-5 x compensation 2-4) and model selection
+#   5b. bootstrap interval for the gradient
+#   5c. external validity of compensation classes (choice of workplace, flexible work)
+#   5d. subgroups: countries, employees, UK weighted
+# Route A: two-dimensional EM; Route B: refit from random starts if supplied starts fail
+# =====================================================================
+NREP5 <- 10                                                              # observed data: number of starts
+B5    <- 200                                                             # bootstrap replicates
+MIN_SINIF <- 0.05                                                        # minimum marginal class share for selection
+
+YC5 <- make_YC(w, 2); iA5 <- 1:8; iB5 <- 9:16
+
+# gradient: cell posteriors and optional weights
+grad2d <- function(ft, wt = NULL) {
+  N <- nrow(ft$post); if (is.null(wt)) wt <- rep(1, N); wt[is.na(wt)] <- 0
+  pPC <- ft$thA[[which(colnames(YC5)[iA5] == "N_PC")]][, 2]
+  a_man <- which.min(pPC); bs <- shift_b(ft)                            # manual = class with the lowest computer need
+  isM <- ft$aOf %in% a_man                                               # manual cells
+  pa_m <- sum(wt * rowSums(ft$post[, isM, drop = FALSE])); pa_o <- sum(wt * rowSums(ft$post[, !isM, drop = FALSE]))
+  pab_m <- sum(wt * rowSums(ft$post[, isM & ft$bOf == bs, drop = FALSE]))
+  pab_o <- sum(wt * rowSums(ft$post[, !isM & ft$bOf == bs, drop = FALSE]))
+  c(P_aktaran_el = pab_m / pa_m, P_aktaran_diger = pab_o / pa_o,           # manual vs all other classes
+    gradyan = pab_m / pa_m - pab_o / pa_o,
+    el_payi = pa_m / sum(wt), aktaran_payi = sum(wt * rowSums(ft$post[, ft$bOf == bs, drop = FALSE])) / sum(wt))
+}
+marg <- function(ft) list(A = sapply(seq_len(ft$Ka), function(a) sum(ft$P[ft$aOf == a])),
+                          B = sapply(seq_len(ft$Kb), function(b) sum(ft$P[ft$bOf == b])))
+
+# ---------- 5a. Model scan: all models and gradient in each ----------
+RUN_5A <- !file.exists("step05_2d_uyum_genis.csv")
+fits5 <- list()
+if (RUN_5A) {
+  rows <- list()
+  for (Ka in 2:5) for (Kb in 2:4) {
+    f <- tryCatch(lca2d_em(YC5, iA5, iB5, Ka, Kb, nrep = NREP5), error = function(e) NULL)
+    if (is.null(f)) next
+    nm <- paste0("2B_A", Ka, "_B", Kb); fits5[[nm]] <- f
+    m <- marg(f); bs <- bvr_sum(bvr_fun(YC5, f)); g <- grad2d(f)
+    rows[[length(rows) + 1]] <- data.frame(model = nm, Ka = Ka, Kb = Kb, LL = f$ll, npar = f$npar, BIC = f$bic,
+      AIC = f$aic, entropi = entropy(f$post), en_kucuk_A = min(m$A), en_kucuk_B = min(m$B), t(bs), t(g))
+  }
+  all5 <- do.call(rbind, rows); all5 <- all5[order(all5$BIC), ]
+  num <- sapply(all5, is.numeric); all5[num] <- lapply(all5[num], round, 4)
+  write_out(all5, "step05_2d_uyum_genis.csv")                           # BIC, BVR and gradient for each model
+}
+all5 <- utils::read.csv("step05_2d_uyum_genis.csv", fileEncoding = "UTF-8-BOM")
+
+# selection: first model in BIC order with all marginal classes >= 5%
+choose_fit <- function() {
+  i <- which(all5$en_kucuk_A >= MIN_SINIF & all5$en_kucuk_B >= MIN_SINIF)[1]
+  if (is.na(i)) stop("Uygun model bulunamadi.")
+  nm <- all5$model[i]
+  f <- if (!is.null(fits5[[nm]])) fits5[[nm]] else lca2d_em(YC5, iA5, iB5, all5$Ka[i], all5$Kb[i], nrep = NREP5)
+  list(fit = f, model = nm, sira = i)
+}
+RUN_5REST <- !file.exists("step05_altgrup_gradyan.csv")
+if (RUN_5REST) {
+  ch <- choose_fit(); f5 <- ch$fit
+  sec <- data.frame(secilen_model = ch$model, BIC_sirasi = ch$sira, en_dusuk_BIC_model = all5$model[1],
+                    gradyan_min_12model = min(all5$gradyan), gradyan_maks_12model = max(all5$gradyan),
+                    Ka = f5$Ka, Kb = f5$Kb, t(round(grad2d(f5), 4)))
+  write_out(sec, "step05_secilen_model.csv")
+
+  # profile (selected model)
+  m <- marg(f5)
+  pr5 <- rbind(
+    do.call(rbind, lapply(seq_along(iA5), function(q) data.frame(boyut = "A_ihtiyac", madde = colnames(YC5)[iA5[q]],
+      sinif = seq_len(f5$Ka), sinif_payi = m$A, P_evet = f5$thA[[q]][, 2]))),
+    do.call(rbind, lapply(seq_along(iB5), function(q) data.frame(boyut = "B_karsilama", madde = colnames(YC5)[iB5[q]],
+      sinif = seq_len(f5$Kb), sinif_payi = m$B, P_evet = f5$thB[[q]][, 2]))))
+  pr5$model <- ch$model; num <- sapply(pr5, is.numeric); pr5[num] <- lapply(pr5[num], round, 4)
+  write_out(pr5, "step05_secilen_profil.csv")
+  # joint cell probabilities
+  cells <- data.frame(model = ch$model, A_sinif = f5$aOf, B_sinif = f5$bOf, P_hucre = round(f5$P, 4))
+  write_out(cells, "step05_secilen_hucreler.csv")
+
+  # ---------- 5b. Bootstrap (resample, refit) ----------
+  init5 <- list(P = f5$P, thA = f5$thA, thB = f5$thB)
+  bt <- list()
+  for (b in seq_len(B5)) {
+    set.seed(31000 + b); idx <- sample.int(nrow(YC5), replace = TRUE)
+    fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, f5$Ka, f5$Kb, nrep = 1, init = init5, tol = 1e-6),
+                   error = function(e) NULL)                              # Route A: supplied starts
+    if (is.null(fb)) fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, f5$Ka, f5$Kb, nrep = 3, tol = 1e-6),
+                                    error = function(e) NULL)              # Route B: random starts
+    if (is.null(fb)) next
+    bt[[length(bt) + 1]] <- data.frame(tekrar = b, t(grad2d(fb)))
+  }
+  bt <- do.call(rbind, bt)
+  write_out(bt, "step05_bootstrap_tekrarlar.csv")
+  g0 <- grad2d(f5)
+  ci <- do.call(rbind, lapply(names(g0), function(v) data.frame(olcu = v, nokta = g0[[v]], bootstrap_ort = mean(bt[[v]]),
+          SE = stats::sd(bt[[v]]), lo_2.5 = stats::quantile(bt[[v]], .025), hi_97.5 = stats::quantile(bt[[v]], .975),
+          n_basarili = nrow(bt))))
+  num <- sapply(ci, is.numeric); ci[num] <- lapply(ci[num], round, 4)
+  write_out(ci, "step05_gradyan_ci.csv")
+
+  # ---------- 5c. External validity of compensation (B) classes ----------
+  pB <- matrix(sapply(seq_len(f5$Kb), function(b) rowSums(f5$post[, f5$bOf == b, drop = FALSE])), nrow(w), f5$Kb)
+  val_vars <- c("Autonomy_Place", "Autonomy_FlexiOptions", "Job_Employed", "Country", "Occupation_SkillGroup", "Gender", "Pay_median")
+  val_vars <- val_vars[val_vars %in% names(w)]
+  val <- do.call(rbind, lapply(val_vars, function(v) {
+    x <- as.character(w[[v]]); x[is.na(x)] <- "NA"
+    do.call(rbind, lapply(sort(unique(x)), function(cat) {
+      i <- x == cat
+      data.frame(degisken = v, kategori = cat, N = sum(i),
+                 t(setNames(100 * colSums(pB[i, , drop = FALSE]) / colSums(pB), paste0("pct_B", seq_len(f5$Kb))))) }))
+  }))
+  # mean choice of workplace (1-5) in each B class
+  ap <- suppressWarnings(as.numeric(w$Autonomy_Place)); okp <- !is.na(ap)
+  mean_ap <- sapply(seq_len(f5$Kb), function(b) sum(pB[okp, b] * ap[okp]) / sum(pB[okp, b]))
+  val <- rbind(val, data.frame(degisken = "Autonomy_Place_ortalama", kategori = "1-5", N = sum(okp),
+                               t(setNames(mean_ap, paste0("pct_B", seq_len(f5$Kb))))))
+  num <- sapply(val, is.numeric); val[num] <- lapply(val[num], round, 3)
+  write_out(val, "step05_B_sinif_dogrulama.csv")
+
+  # ---------- 5d. Subgroups ----------
+  sub_fit <- function(rows_i, lab, wt = NULL) {
+    f <- tryCatch(lca2d_em(YC5[rows_i, ], iA5, iB5, f5$Ka, f5$Kb, nrep = NREP5), error = function(e) NULL)
+    if (is.null(f)) return(data.frame(grup = lab, N = length(rows_i), not = "kurulamadi"))
+    g <- grad2d(f, wt)
+    data.frame(grup = lab, N = length(rows_i), t(round(g, 4)), not = "")
+  }
+  sg <- list(
+    sub_fit(which(w$Country == "France"), "Fransa"),
+    sub_fit(which(w$Country == "United Kingdom"), "Birlesik_Krallik"),
+    sub_fit(which(!is.na(w$Job_Employed) & w$Job_Employed == 1), "Sadece_ucretli"))
+  uk <- which(w$Country == "United Kingdom")
+  sg[[4]] <- sub_fit(uk, "Birlesik_Krallik_agirlikli", wt = w$Weight[uk])
+  # common measurement (classes fixed from the pooled model); subgroup distribution by posterior weighting
+  pool_row <- function(ind, lab, wt = rep(1, nrow(w))) {
+    ww <- ifelse(ind, wt, 0); ww[is.na(ww)] <- 0
+    data.frame(grup = lab, N = sum(ind), t(round(grad2d(f5, ww), 4)), not = "ortak_olcum") }
+  sg[[5]] <- pool_row(w$Country == "France", "Fransa_ortak_olcum")
+  sg[[6]] <- pool_row(w$Country == "United Kingdom", "Birlesik_Krallik_ortak_olcum")
+  sg[[7]] <- pool_row(w$Country == "United Kingdom", "Birlesik_Krallik_ortak_olcum_agirlikli", wt = w$Weight)
+  sg[[8]] <- pool_row(!is.na(w$Job_Employed) & w$Job_Employed == 1, "Sadece_ucretli_ortak_olcum")
+  sg <- do.call(rbind, lapply(sg, function(d) { for (v in c("P_aktaran_el", "P_aktaran_diger", "gradyan", "el_payi", "aktaran_payi"))
+                                                   if (!v %in% names(d)) d[[v]] <- NA; d }))
+  write_out(sg[, c("grup", "N", "P_aktaran_el", "P_aktaran_diger", "gradyan", "el_payi", "aktaran_payi", "not")],
+            "step05_altgrup_gradyan.csv")
+}
+
+
+# =====================================================================
+# STEP06 - gradient under two group definitions; tables
+#   6a. refit 12 models (same seeds and solutions as step05)
+#       narrow definition: single class with the lowest computer need; main: all classes with P(computer) < 0.5
+#   6b. bootstrap (200), both definitions
+#   6c. subgroups, both definitions
+#   6d. tables (CSV)
+#   6e. figures: see the end of the script
+# =====================================================================
+NREP6 <- 10                                                              # same as step05 (same solutions)
+B6    <- 200                                                             # bootstrap replicates
+THR6  <- 0.5                                                             # threshold: P(computer need) < 0.5
+
+grad2d_v2 <- function(ft, wt = NULL, thr = THR6) {                       # main definition: all classes below the threshold
+  N <- nrow(ft$post); if (is.null(wt)) wt <- rep(1, N); wt[is.na(wt)] <- 0
+  pPC <- ft$thA[[which(colnames(YC5)[iA5] == "N_PC")]][, 2]
+  man <- which(pPC < thr); if (!length(man)) man <- which.min(pPC)      # if none, the lowest class
+  bs  <- shift_b(ft); isM <- ft$aOf %in% man
+  pa_m <- sum(wt * rowSums(ft$post[, isM, drop = FALSE])); pa_o <- sum(wt * rowSums(ft$post[, !isM, drop = FALSE]))
+  pab_m <- sum(wt * rowSums(ft$post[, isM & ft$bOf == bs, drop = FALSE]))
+  pab_o <- sum(wt * rowSums(ft$post[, !isM & ft$bOf == bs, drop = FALSE]))
+  c(P_aktaran_el = pab_m / pa_m, P_aktaran_diger = pab_o / pa_o, gradyan = pab_m / pa_m - pab_o / pa_o,
+    el_payi = pa_m / sum(wt), n_el_sinif = length(man))
+}
+both_grad <- function(ft, wt = NULL) {                                   # both definitions side by side
+  g1 <- grad2d(ft, wt); g2 <- grad2d_v2(ft, wt)
+  c(gradyan_eski = g1[["gradyan"]], gradyan_yeni = g2[["gradyan"]],
+    P_aktaran_el_yeni = g2[["P_aktaran_el"]], P_aktaran_diger_yeni = g2[["P_aktaran_diger"]],
+    el_payi_yeni = g2[["el_payi"]], n_el_sinif = g2[["n_el_sinif"]])
+}
+
+RUN_6 <- !file.exists("step06_altgrup_gradyan.csv")
+if (!RUN_6) message("step06 hesaplamalari mevcut, atlandi (tablolar ve sekiller yeniden uretilir).")
+if (RUN_6) {
+  # ---------- 6a. 12 models ----------
+  old5 <- utils::read.csv("step05_2d_uyum_genis.csv", fileEncoding = "UTF-8-BOM")
+  fits6 <- list(); r6 <- list()
+  for (Ka in 2:5) for (Kb in 2:4) {
+    f <- tryCatch(lca2d_em(YC5, iA5, iB5, Ka, Kb, nrep = NREP6), error = function(e) NULL)
+    if (is.null(f)) next
+    nm <- paste0("2B_A", Ka, "_B", Kb); fits6[[nm]] <- f
+    ll5 <- old5$LL[old5$model == nm]
+    r6[[length(r6) + 1]] <- data.frame(model = nm, Ka = Ka, Kb = Kb, LL = f$ll, BIC = f$bic,
+      LL_step05 = if (length(ll5)) ll5 else NA, t(both_grad(f)))
+  }
+  r6 <- do.call(rbind, r6); r6 <- r6[order(r6$BIC), ]
+  r6$ayni_cozum <- abs(r6$LL - r6$LL_step05) < 0.01                      # same as step05?
+  num <- sapply(r6, is.numeric); r6[num] <- lapply(r6[num], round, 4)
+  write_out(r6, "step06_12model_gradyan.csv")
+
+  # selected model (same rule as step05)
+  sel <- utils::read.csv("step05_secilen_model.csv", fileEncoding = "UTF-8-BOM")$secilen_model[1]
+  f6 <- fits6[[sel]]
+  if (is.null(f6)) stop("Secilen model kurulamadi: ", sel)
+
+  # ---------- 6b. Bootstrap ----------
+  init6 <- list(P = f6$P, thA = f6$thA, thB = f6$thB); bt6 <- list()
+  for (b in seq_len(B6)) {
+    set.seed(31000 + b); idx <- sample.int(nrow(YC5), replace = TRUE)   # same resamples as step05
+    fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, f6$Ka, f6$Kb, nrep = 1, init = init6, tol = 1e-6),
+                   error = function(e) NULL)                              # Route A: supplied starts
+    if (is.null(fb)) fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, f6$Ka, f6$Kb, nrep = 3, tol = 1e-6),
+                                    error = function(e) NULL)              # Route B: random starts
+    if (is.null(fb)) next
+    bt6[[length(bt6) + 1]] <- data.frame(tekrar = b, t(both_grad(fb)))
+  }
+  bt6 <- do.call(rbind, bt6)
+  write_out(bt6, "step06_bootstrap_tekrarlar.csv")
+  g0 <- both_grad(f6)
+  ci6 <- do.call(rbind, lapply(c("gradyan_eski", "gradyan_yeni", "P_aktaran_el_yeni", "P_aktaran_diger_yeni", "el_payi_yeni"),
+    function(v) data.frame(olcu = v, nokta = g0[[v]], bootstrap_ort = mean(bt6[[v]]), SE = stats::sd(bt6[[v]]),
+                           lo_2.5 = stats::quantile(bt6[[v]], .025), hi_97.5 = stats::quantile(bt6[[v]], .975),
+                           pct_sifir_alti = 100 * mean(bt6[[v]] <= 0), n_basarili = nrow(bt6))))
+  num <- sapply(ci6, is.numeric); ci6[num] <- lapply(ci6[num], round, 4)
+  write_out(ci6, "step06_gradyan_ci.csv")
+
+  # ---------- 6c. Subgroups ----------
+  sub6 <- function(rows_i, lab, wt = NULL) {
+    f <- tryCatch(lca2d_em(YC5[rows_i, ], iA5, iB5, f6$Ka, f6$Kb, nrep = NREP6), error = function(e) NULL)
+    if (is.null(f)) return(NULL)
+    data.frame(grup = lab, N = length(rows_i), olcum = "ayri_model", t(round(both_grad(f, wt), 4)))
+  }
+  pool6 <- function(ind, lab, wt = rep(1, nrow(w))) {
+    ww <- ifelse(ind, wt, 0); ww[is.na(ww)] <- 0
+    data.frame(grup = lab, N = sum(ind), olcum = "ortak_olcum", t(round(both_grad(f6, ww), 4)))
+  }
+  fr <- w$Country == "France"; ukl <- w$Country == "United Kingdom"
+  emp <- !is.na(w$Job_Employed) & w$Job_Employed == 1; uk <- which(ukl)
+  sg6 <- rbind(
+    pool6(rep(TRUE, nrow(w)), "Tum_orneklem"),
+    pool6(fr, "Fransa"), pool6(ukl, "Birlesik_Krallik"), pool6(ukl, "Birlesik_Krallik_agirlikli", wt = w$Weight),
+    pool6(emp, "Sadece_ucretli"),
+    sub6(which(fr), "Fransa"), sub6(uk, "Birlesik_Krallik"), sub6(uk, "Birlesik_Krallik_agirlikli", wt = w$Weight[uk]),
+    sub6(which(emp), "Sadece_ucretli"))
+  write_out(sg6, "step06_altgrup_gradyan.csv")
+}
+
+# =====================================================================
+# 6d. Tables (regenerated on every run)
+# =====================================================================
+rd <- function(f) utils::read.csv(f, fileEncoding = "UTF-8-BOM", stringsAsFactors = FALSE)
+lbl_item <- c(Transportation = "Transport", Safety = "Safety equipment", Appearance = "Clothing/uniform", PC = "Computer",
+              Phone = "Phone", Internet = "Internet", Gifts = "Gifts/hospitality", Workspace = "Workspace")
+
+# Table: conditional vs merged prevalence (materials, threshold 3, by country and pooled)
+if (file.exists("step02_kosullu_yayginlik.csv")) {
+  p <- rd("step02_kosullu_yayginlik.csv"); p <- p[p$boyut == "malzeme" & p$esik == 3, ]
+  t1 <- do.call(rbind, lapply(names(lbl_item), function(it) {
+    g <- function(gr, v) p[[v]][p$kalem == it & p$grup == gr]
+    data.frame(Item = lbl_item[[it]],
+               Need_pct_pooled = round(100 * g("Pooled", "N_maruz") / g("Pooled", "N_tum"), 1),
+               All_workers_pct_FR = g("France", "pct_tum"), Exposed_pct_FR = g("France", "pct_kosullu"),
+               All_workers_pct_UK = g("United Kingdom", "pct_tum"), Exposed_pct_UK = g("United Kingdom", "pct_kosullu"),
+               Exposed_pct_UK_weighted = g("United Kingdom", "pct_kosullu_w"),
+               Ratio_pooled = g("Pooled", "oran_kosullu_tum")) }))
+  write_out(t1, "table1_prevalence_merged_vs_conditional.csv")
+}
+
+# Table: Monte Carlo summary (step04)
+if (file.exists("step04_montecarlo.csv")) {
+  m <- rd("step04_montecarlo.csv"); m <- m[m$yontem %in% c("M", "C", "C2B_model"), ]
+  m$Method <- c(M = "Merged coding (LCA)", C = "Conditional coding, one-dimensional LCA",
+                C2B_model = "Conditional coding, two-dimensional LCA")[m$yontem]
+  m$Scenario <- c(S1_bagimsiz = "S1 independent", S2_bagimli = "S2 dependent", S3_bagimli_guclu = "S3 strongly dependent",
+                  S4_bagimli_el_emegi_az = "S4 dependent, small manual group")[m$senaryo]
+  t2 <- data.frame(Scenario = m$Scenario, Method = m$Method, True_gradient = m$gercek, Mean_estimate = m$ort_tahmin,
+                   Mean_bias = m$ort_yanlilik, SD = m$sd, RMSE = m$RMSE, Pct_error_gt_0.25 = m$basarisiz_pct, Replications = m$n)
+  t2 <- t2[order(t2$Scenario, t2$Method), ]
+  write_out(t2, "table2_montecarlo.csv")
+}
+
+# Table: fit and gradient of 12 models (two definitions)
+if (file.exists("step06_12model_gradyan.csv")) {
+  a <- rd("step05_2d_uyum_genis.csv"); g <- rd("step06_12model_gradyan.csv")
+  t3 <- merge(a[, c("model", "Ka", "Kb", "LL", "npar", "BIC", "entropi", "en_kucuk_A", "en_kucuk_B", "n_asim", "maks_BVR")],
+              g[, c("model", "gradyan_eski", "gradyan_yeni", "n_el_sinif")], by = "model")
+  t3 <- t3[order(t3$BIC), ]
+  names(t3) <- c("Model", "Need_classes", "Compensation_classes", "LogLik", "Parameters", "BIC", "Entropy",
+                 "Smallest_need_class", "Smallest_comp_class", "Pairs_BVR_gt_3.84", "Max_BVR",
+                 "Gradient_single_class", "Gradient_threshold", "Manual_classes_n")
+  write_out(t3, "table3_model_selection_gradient.csv")
+}
+
+# Table: profile of the selected model (need and compensation)
+if (file.exists("step05_secilen_profil.csv")) {
+  pr <- rd("step05_secilen_profil.csv")
+  pr$Item <- lbl_item[sub("^[NC]_", "", pr$madde)]
+  t4 <- stats::reshape(pr[, c("boyut", "Item", "sinif", "P_evet")], idvar = c("boyut", "Item"), timevar = "sinif",
+                       direction = "wide")
+  names(t4) <- sub("P_evet\\.", "Class_", names(t4)); names(t4)[1] <- "Dimension"
+  t4$Dimension <- ifelse(t4$Dimension == "A_ihtiyac", "Need: P(item needed)", "Compensation: P(not fully paid | needed)")
+  shares <- stats::aggregate(sinif_payi ~ boyut + sinif, data = pr, FUN = function(x) x[1])
+  write_out(t4, "table4_selected_model_profiles.csv")
+  write_out(shares, "table4b_selected_model_class_shares.csv")
+}
+
+# Table: robustness (bootstrap and subgroups)
+if (file.exists("step06_gradyan_ci.csv")) {
+  ci <- rd("step06_gradyan_ci.csv"); sg <- rd("step06_altgrup_gradyan.csv")
+  t5 <- rbind(
+    data.frame(Analysis = paste0("Bootstrap (", ci$n_basarili[1], ")"), Definition = ci$olcu, Estimate = ci$nokta,
+               SE = ci$SE, CI_low = ci$lo_2.5, CI_high = ci$hi_97.5),
+    data.frame(Analysis = paste(sg$grup, sg$olcum, sep = " / "), Definition = "gradyan_yeni", Estimate = sg$gradyan_yeni,
+               SE = NA, CI_low = NA, CI_high = NA),
+    data.frame(Analysis = paste(sg$grup, sg$olcum, sep = " / "), Definition = "gradyan_eski", Estimate = sg$gradyan_eski,
+               SE = NA, CI_low = NA, CI_high = NA))
+  write_out(t5, "table5_robustness.csv")
+}
+
+# Table: external validity of compensation classes (step05)
+if (file.exists("step05_B_sinif_dogrulama.csv")) write_out(rd("step05_B_sinif_dogrulama.csv"), "table6_compensation_validation.csv")
+
+message("\nBITTI. Ciktilar: ", proj)
+
+# =====================================================================
+# STEP07 - additional checks
+#   7a. refit the 5 x 4 model (same seeds); gradient by observed occupation (ISCO)
+#   7b. larger models: 6x4, 5x5, 6x5
+#   7c. drop each item in turn (8 models) and stricter threshold (c = 3) for 5 x 4
+#   7d. cross-table of the 1D manual class and 2D profiles
+#   7e. Monte Carlo: scenarios violating model assumptions (S5-S9)
+#   7f. (optional) bootstrap: set RUN_B7 <- TRUE
+# Route A: supplied starts / poLCA; Route B: random starts / own EM
+# =====================================================================
+NREP7  <- 10                                                             # observed data: number of starts (as in step05/06)
+MC_R7  <- 50                                                             # Monte Carlo: replicates per scenario
+NREP7_MC <- 5                                                            # Monte Carlo: number of starts
+B7     <- 1000                                                           # bootstrap replicates (optional)
+RUN_B7 <- TRUE                                                           # bootstrap (long run); set FALSE to skip
+B7_POST <- 1000                                                          # fast posterior bootstrap for ISCO differences
+
+# ---------- gradient for any item set ----------
+grad_gen <- function(ft, Y, iA, wt = NULL, thr = THR6, key = "N_PC") {
+  N <- nrow(ft$post); if (is.null(wt)) wt <- rep(1, N); wt[is.na(wt)] <- 0
+  q <- which(colnames(Y)[iA] == key)
+  if (!length(q)) q <- which(colnames(Y)[iA] == "N_Internet")           # use internet need if the computer item is dropped
+  pk <- ft$thA[[q]][, 2]
+  man <- which(pk < thr); if (!length(man) || length(man) == ft$Ka) man <- which.min(pk)
+  bs <- shift_b(ft); isM <- ft$aOf %in% man
+  pa_m <- sum(wt * rowSums(ft$post[, isM, drop = FALSE])); pa_o <- sum(wt * rowSums(ft$post[, !isM, drop = FALSE]))
+  pab_m <- sum(wt * rowSums(ft$post[, isM & ft$bOf == bs, drop = FALSE]))
+  pab_o <- sum(wt * rowSums(ft$post[, !isM & ft$bOf == bs, drop = FALSE]))
+  c(P_aktaran_el = pab_m / pa_m, P_aktaran_diger = pab_o / pa_o, gradyan = pab_m / pa_m - pab_o / pa_o,
+    el_payi = pa_m / sum(wt), n_el_sinif = length(man), ayirici = q)
+}
+# person level: probability of the cost-shifting regime and of a manual profile
+person_probs <- function(ft, Y, iA, thr = THR6) {
+  pk <- ft$thA[[which(colnames(Y)[iA] == "N_PC")]][, 2]
+  man <- which(pk < thr); if (!length(man)) man <- which.min(pk)
+  bs <- shift_b(ft)
+  list(p_shift = rowSums(ft$post[, ft$bOf == bs, drop = FALSE]),          # P(cost-shifting regime | responses)
+       p_man = rowSums(ft$post[, ft$aOf %in% man, drop = FALSE]))         # P(manual profile | responses)
+}
+fit_summary <- function(f, Y, nm, iA, iB) {
+  m <- list(A = sapply(seq_len(f$Ka), function(a) sum(f$P[f$aOf == a])),
+            B = sapply(seq_len(f$Kb), function(b) sum(f$P[f$bOf == b])))
+  data.frame(model = nm, Ka = f$Ka, Kb = f$Kb, LL = f$ll, npar = f$npar, BIC = f$bic, entropi = entropy(f$post),
+             en_kucuk_A = min(m$A), en_kucuk_B = min(m$B), t(bvr_sum(bvr_fun(Y, f))), t(grad_gen(f, Y, iA)))
+}
+
+# ---------- 7a. selected model and observed occupation ----------
+RUN_7A <- !file.exists("step07_isco_gradyan.csv")
+f7 <- NULL
+if (RUN_7A || !file.exists("step07_duyarlilik.csv") || !file.exists("step07_1d_2d_capraz.csv") || RUN_B7) {
+  f7 <- lca2d_em(YC5, iA5, iB5, 5, 4, nrep = NREP7)                      # same seeds as step05/06
+  ll_ref <- tryCatch(utils::read.csv("step06_12model_gradyan.csv", fileEncoding = "UTF-8-BOM"), error = function(e) NULL)
+  ll_ref <- if (!is.null(ll_ref)) ll_ref$LL[ll_ref$model == "2B_A5_B4"] else NA
+  write_out(data.frame(model = "2B_A5_B4", LL_step07 = round(f7$ll, 4), LL_step06 = ll_ref,
+                       ayni_cozum = abs(f7$ll - ll_ref) < 0.01, t(round(grad_gen(f7, YC5, iA5), 4))),
+            "step07_kontrol_cozum.csv")                                  # check: same solution
+}
+if (RUN_7A) {
+  pp <- person_probs(f7, YC5, iA5)
+  isco <- suppressWarnings(as.numeric(as.character(w$ISCO_1D)))         # ISCO major group (1-9)
+  skl  <- suppressWarnings(as.numeric(as.character(w$Occupation_SkillGroup)))  # skill level (1 = lowest)
+  emp  <- !is.na(w$Job_Employed) & w$Job_Employed == 1
+  # (i) mean P(cost-shifting) and P(manual profile) by ISCO major group
+  tab <- do.call(rbind, lapply(1:9, function(g) { i <- !is.na(isco) & isco == g
+    data.frame(grup = paste0("ISCO_", g), N = sum(i), N_a = sum(i), N_b = NA, P_aktaran_a = mean(pp$p_shift[i]),
+               P_aktaran_b = NA, fark = NA, lo_2.5 = NA, hi_97.5 = NA, P_el_profili_a = mean(pp$p_man[i]),
+               P_el_profili_b = NA) }))
+  # (ii) observed occupation comparisons: difference and posterior bootstrap interval (model fixed)
+  contr <- list(
+    list(ad = "ISCO_5-9_vs_1-4", a = !is.na(isco) & isco >= 5, b = !is.na(isco) & isco >= 1 & isco <= 4),
+    list(ad = "ISCO_7-9_vs_1-3", a = !is.na(isco) & isco >= 7, b = !is.na(isco) & isco >= 1 & isco <= 3),
+    list(ad = "Beceri_1-2_vs_3-4", a = !is.na(skl) & skl <= 2, b = !is.na(skl) & skl >= 3),
+    list(ad = "ISCO_5-9_vs_1-4_sadece_ucretli", a = emp & !is.na(isco) & isco >= 5, b = emp & !is.na(isco) & isco >= 1 & isco <= 4))
+  set.seed(7007)
+  cres <- do.call(rbind, lapply(contr, function(k) {
+    ia <- which(k$a); ib <- which(k$b)
+    d0 <- mean(pp$p_shift[ia]) - mean(pp$p_shift[ib])
+    bt <- replicate(B7_POST, mean(pp$p_shift[sample(ia, replace = TRUE)]) - mean(pp$p_shift[sample(ib, replace = TRUE)]))
+    data.frame(grup = k$ad, N = length(ia) + length(ib), N_a = length(ia), N_b = length(ib),
+               P_aktaran_a = mean(pp$p_shift[ia]), P_aktaran_b = mean(pp$p_shift[ib]), fark = d0,
+               lo_2.5 = stats::quantile(bt, .025), hi_97.5 = stats::quantile(bt, .975),
+               P_el_profili_a = mean(pp$p_man[ia]), P_el_profili_b = mean(pp$p_man[ib])) }))
+  out <- rbind(cres, tab)
+  num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
+  write_out(out, "step07_isco_gradyan.csv")
+}
+
+# ---------- 7b-7c. Sensitivity: larger models, item deletion, stricter threshold ----------
+RUN_7C <- !file.exists("step07_duyarlilik.csv")
+if (RUN_7C) {
+  rr <- list(fit_summary(f7, YC5, "2B_A5_B4_secilen", iA5, iB5))
+  for (kk in list(c(6, 4), c(5, 5), c(6, 5))) {                          # 7b: larger models
+    f <- tryCatch(lca2d_em(YC5, iA5, iB5, kk[1], kk[2], nrep = NREP7), error = function(e) NULL)
+    if (!is.null(f)) rr[[length(rr) + 1]] <- fit_summary(f, YC5, paste0("2B_A", kk[1], "_B", kk[2]), iA5, iB5)
+    message("step07: ", kk[1], "x", kk[2], " tamam")
+  }
+  init_drop <- function(j) list(P = f7$P, thA = f7$thA[-j], thB = f7$thB[-j])  # start from the same solution
+  for (j in seq_along(tools)) {                                          # 7c: drop each item in turn
+    Yd <- YC5[, -c(j, 8 + j)]; iAd <- 1:7; iBd <- 8:14
+    f <- tryCatch(lca2d_em(Yd, iAd, iBd, 5, 4, nrep = NREP7, init = init_drop(j)), error = function(e) NULL)  # Route A
+    if (is.null(f)) f <- tryCatch(lca2d_em(Yd, iAd, iBd, 5, 4, nrep = NREP7), error = function(e) NULL)       # Route B
+    if (!is.null(f)) rr[[length(rr) + 1]] <- fit_summary(f, Yd, paste0("cikarilan_", tools[j]), iAd, iBd)
+  }
+  YC7_3 <- make_YC(w, 3)                                                 # stricter threshold: mostly or entirely unpaid
+  f <- tryCatch(lca2d_em(YC7_3, iA5, iB5, 5, 4, nrep = NREP7), error = function(e) NULL)
+  if (!is.null(f)) rr[[length(rr) + 1]] <- fit_summary(f, YC7_3, "esik3_2B_A5_B4", iA5, iB5)
+  rr <- do.call(rbind, rr); num <- sapply(rr, is.numeric); rr[num] <- lapply(rr[num], round, 4)
+  write_out(rr, "step07_duyarlilik.csv")
+}
+
+# ---------- 7d. cross-table of the 1D manual class and 2D profiles ----------
+RUN_7D <- !file.exists("step07_1d_2d_capraz.csv")
+if (RUN_7D) {
+  set.seed(2024); f1 <- run_lca(YC5, 3, nrep = NREP7)                   # Route A: poLCA; Route B: own EM
+  h <- hidden_id(f1); c1 <- ifelse(apply(f1$post, 1, which.max) == h, "1D_el_emegi", "1D_diger")
+  pp <- person_probs(f7, YC5, iA5)
+  aMod <- apply(sapply(seq_len(f7$Ka), function(a) rowSums(f7$post[, f7$aOf == a, drop = FALSE])), 1, which.max)
+  bMod <- apply(sapply(seq_len(f7$Kb), function(b) rowSums(f7$post[, f7$bOf == b, drop = FALSE])), 1, which.max)
+  pk <- f7$thA[[which(colnames(YC5)[iA5] == "N_PC")]][, 2]; man <- which(pk < THR6); bs <- shift_b(f7)
+  cr <- as.data.frame(table(sinif_1D = c1, A_2D = paste0("A", aMod), B_2D = paste0("B", bMod)))
+  cr <- cr[cr$Freq > 0, ]
+  cr$A_el_profili <- cr$A_2D %in% paste0("A", man); cr$B_aktaran <- cr$B_2D == paste0("B", bs)
+  ozet <- do.call(rbind, lapply(c("1D_el_emegi", "1D_diger"), function(g) { i <- c1 == g
+    data.frame(sinif_1D = g, A_2D = "ozet", B_2D = "ozet", Freq = sum(i), A_el_profili = mean(pp$p_man[i]),
+               B_aktaran = mean(pp$p_shift[i])) }))
+  out <- rbind(cr, ozet); out$ARI_1D_vs_2D_A <- round(ari(apply(f1$post, 1, which.max), aMod), 4)
+  out$yol_1D <- f1$yol
+  write_out(out, "step07_1d_2d_capraz.csv")
+}
+
+# ---------- 7e. Monte Carlo: misspecification scenarios ----------
+need_mob7 <- c(.61, .51, .63, .23, .89, .70, .04, .38)                   # field profile (from the selected model)
+unp2 <- rbind(c(rep(.05, 8)), c(rep(.45, 8)))                            # generous / cost-shifting
+unp3 <- rbind(c(rep(.05, 8)), c(rep(.25, 8)), c(rep(.45, 8)))            # generous / partial / cost-shifting
+base7 <- list(N = 2952, share = c(.7, .3), need = rbind(need_dig4, need_man4), manual = 2,
+              regp = rbind(c(.85, .15), c(.5, .5)), unp = unp2, shift = 2, ld_need = list(), ld_pay = list(), rho = .7)
+mod7 <- function(...) { s <- base7; a <- list(...); s[names(a)] <- a; s }
+scen7 <- list(
+  S5_ihtiyac_yerel_bagimlilik = mod7(ld_need = list(c(2, 3), c(6, 8))),  # safety -> clothing, internet -> workspace
+  S6_odeme_yerel_bagimlilik   = mod7(ld_pay = list(c(5, 6), c(2, 3))),   # phone -> internet, safety -> clothing
+  S7_uc_ihtiyac_profili       = mod7(share = c(.7, .15, .15), need = rbind(need_dig4, need_man4, need_mob7),
+                                     manual = c(2, 3), regp = rbind(c(.85, .15), c(.5, .5), c(.5, .5))),
+  S8_uc_karsilama_rejimi      = mod7(regp = rbind(c(.70, .15, .15), c(.30, .20, .50)), unp = unp3, shift = 3),
+  S9_kucuk_orneklem           = mod7(N = 1000))
+sim7 <- function(sc) {
+  N <- sc$N
+  prof <- sample.int(nrow(sc$need), N, replace = TRUE, prob = sc$share)  # true need profile
+  reg  <- vapply(prof, function(k) sample.int(ncol(sc$regp), 1, prob = sc$regp[k, ]), 1L)  # true regime
+  nd <- matrix(stats::rbinom(N * 8, 1, sc$need[prof, ]), N, 8)
+  un <- matrix(stats::rbinom(N * 8, 1, sc$unp[reg, ]), N, 8)
+  for (pr in sc$ld_need) { cp <- stats::rbinom(N, 1, sc$rho) == 1; nd[cp, pr[2]] <- nd[cp, pr[1]] }  # local dependence
+  for (pr in sc$ld_pay)  { cp <- stats::rbinom(N, 1, sc$rho) == 1; un[cp, pr[2]] <- un[cp, pr[1]] }
+  YMs <- ifelse(nd == 0, 1, un + 1); YCs <- cbind(nd + 1, ifelse(nd == 1, un + 1, NA))
+  colnames(YMs) <- paste0("M", 1:8); colnames(YCs) <- c(paste0("N", 1:8), paste0("C", 1:8))
+  list(man = as.integer(prof %in% sc$manual), sh = as.integer(reg == sc$shift), YM = YMs, YC = YCs)
+}
+RUN_7E <- !file.exists("step07_montecarlo.csv")
+if (RUN_7E) {
+  mc7 <- list()
+  for (s in seq_along(scen7)) for (r in seq_len(MC_R7)) {
+    set.seed(70000 + 100 * s + r); sc <- scen7[[s]]; sm <- sim7(sc)
+    gap <- function(p) mean(p[sm$man == 1]) - mean(p[sm$man == 0])      # true difference between groups
+    fM <- run_lca(sm$YM, 2, NREP7_MC); fC <- run_lca(sm$YC, 4, NREP7_MC)
+    f2 <- tryCatch(lca2d_em(sm$YC, 1:8, 9:16, 2, 2, nrep = NREP7_MC, maxit = 1500, tol = 1e-6), error = function(e) NULL)
+    g2k <- g2m <- NA
+    if (!is.null(f2)) {
+      b2 <- shift_b(f2); g2k <- gap(rowSums(f2$post[, f2$bOf == b2, drop = FALSE]))   # person-based
+      pPC2 <- f2$thA[[4]][, 2]; am <- which(pPC2 < .5); if (!length(am) || length(am) == 2) am <- which.min(pPC2)
+      pa <- sapply(1:2, function(a) sum(f2$P[f2$aOf == a])); isM <- f2$aOf %in% am
+      g2m <- sum(f2$P[isM & f2$bOf == b2]) / sum(pa[am]) - sum(f2$P[!isM & f2$bOf == b2]) / sum(pa[-am])  # model-based
+    }
+    mc7[[length(mc7) + 1]] <- data.frame(senaryo = names(scen7)[s], tekrar = r, N = sc$N, gercek = gap(sm$sh),
+      M = gap(shift_post4(fM, 1:8)), C = gap(shift_post4(fC, 9:16)), C2B_kisi = g2k, C2B_model = g2m)
+    if (r %% 10 == 0) message("step07 MC: ", names(scen7)[s], " ", r, "/", MC_R7)
+  }
+  mc7 <- do.call(rbind, mc7)
+  write_out(mc7, "step07_montecarlo_tekrarlar.csv")
+  long <- do.call(rbind, lapply(c("M", "C", "C2B_kisi", "C2B_model"), function(m)
+    do.call(rbind, lapply(split(mc7, mc7$senaryo), function(d) {
+      e <- d[[m]] - d$gercek; e <- e[!is.na(e)]
+      data.frame(senaryo = d$senaryo[1], yontem = m, gercek = mean(d$gercek), ort_tahmin = mean(d[[m]], na.rm = TRUE),
+                 ort_yanlilik = mean(e), sd = stats::sd(d[[m]], na.rm = TRUE), RMSE = sqrt(mean(e^2)),
+                 hata_gt_025_pct = 100 * mean(abs(e) > .25), yakalanan_pay = mean(d[[m]], na.rm = TRUE) / mean(d$gercek),
+                 n = length(e)) }))))
+  num <- sapply(long, is.numeric); long[num] <- lapply(long[num], round, 3)
+  write_out(long, "step07_montecarlo.csv")
+}
+
+# ---------- 7f. (optional) bootstrap: need-profile gradient and observed ISCO difference ----------
+if (RUN_B7 && !file.exists("step07_bootstrap1000_ci.csv")) {
+  isco <- suppressWarnings(as.numeric(as.character(w$ISCO_1D)))
+  init7 <- list(P = f7$P, thA = f7$thA, thB = f7$thB); bt7 <- list(); t0 <- Sys.time()
+  for (b in seq_len(B7)) {
+    set.seed(31000 + b); idx <- sample.int(nrow(YC5), replace = TRUE)   # first 200 replicates as in step06
+    fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, 5, 4, nrep = 1, init = init7, tol = 1e-6), error = function(e) NULL)
+    if (is.null(fb)) fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, 5, 4, nrep = 3, tol = 1e-6), error = function(e) NULL)
+    if (is.null(fb)) next
+    g <- grad_gen(fb, YC5, iA5); pb <- person_probs(fb, YC5, iA5); ib <- isco[idx]
+    dI <- mean(pb$p_shift[!is.na(ib) & ib >= 5]) - mean(pb$p_shift[!is.na(ib) & ib >= 1 & ib <= 4])
+    bt7[[length(bt7) + 1]] <- data.frame(tekrar = b, gradyan = g[["gradyan"]], P_aktaran_el = g[["P_aktaran_el"]],
+                                         P_aktaran_diger = g[["P_aktaran_diger"]], ISCO_5_9_vs_1_4 = dI)
+    if (b %% 50 == 0) message("bootstrap ", b, "/", B7, " | gecen sure: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+  }
+  bt7 <- do.call(rbind, bt7); write_out(bt7, "step07_bootstrap1000_tekrarlar.csv")
+  ci7 <- do.call(rbind, lapply(names(bt7)[-1], function(v) data.frame(olcu = v, ort = mean(bt7[[v]]), SE = stats::sd(bt7[[v]]),
+           lo_2.5 = stats::quantile(bt7[[v]], .025), hi_97.5 = stats::quantile(bt7[[v]], .975),
+           pct_sifir_alti = 100 * mean(bt7[[v]] <= 0), n_basarili = nrow(bt7))))
+  num <- sapply(ci7, is.numeric); ci7[num] <- lapply(ci7[num], round, 4)
+  write_out(ci7, "step07_bootstrap1000_ci.csv")
+}
+message("step07 tamamlandi.")
+
+
+# =====================================================================
+# STEP09 - measurement and identification checks
+#   9a. Measurement assumption: do compensation probabilities differ by need profile?
+#       (i) residual check: observed vs model-implied unpaid rates in manual / other profiles
+#       (ii) relaxed model: B item probabilities free in manual and other profiles -> BIC, gradient
+#   9b. Identification: 50 random starts for 5 x 4 and 6 x 5; 6 x 5 profiles and cross-table with 5 x 4
+#   9c. Strictest threshold: c = 4 ("not paid at all" only)
+#   9d. Profile of the 38 respondents excluded for missing filter answers
+#   9e. Monte Carlo: S10-S12 (payment probabilities varying by need or country)
+# Route A: supplied starts; Route B: random starts
+# =====================================================================
+NSTART9 <- 50                                                            # 9b: number of random starts
+MC_R9   <- 50                                                            # 9e: replicates per scenario
+
+need_f9 <- any(!file.exists(c("step09_olcum_varsayimi.csv", "step09_esik4.csv")))
+f9 <- NULL
+if (need_f9) f9 <- lca2d_em(YC5, iA5, iB5, 5, 4, nrep = 10)              # selected model (same seeds, same solution)
+
+# ---------- 9a. measurement assumption ----------
+# relaxed model: B item probabilities separate for the two need groups (manual / other)
+lca2d_em_dif <- function(Y, idxA, idxB, Ka, Kb, gA, init, maxit = 3000, tol = 1e-7) {
+  Y <- as.matrix(Y); N <- nrow(Y); R <- apply(Y, 2, max, na.rm = TRUE)
+  C <- Ka * Kb; aOf <- rep(seq_len(Ka), times = Kb); bOf <- rep(seq_len(Kb), each = Ka)
+  key <- (gA[aOf] - 1) * Kb + bOf                                        # cell -> (group, b) key
+  pc <- init$P; thA <- init$thA
+  thB <- lapply(init$thB, function(m) rbind(m, m))                       # both groups start from the same values
+  ll_old <- -Inf
+  for (it in seq_len(maxit)) {
+    LA <- matrix(0, N, Ka); LB <- matrix(0, N, 2 * Kb)
+    for (q in seq_along(idxA)) { y <- Y[, idxA[q]]; ok <- !is.na(y); LA[ok, ] <- LA[ok, ] + t(log(thA[[q]][, y[ok], drop = FALSE])) }
+    for (q in seq_along(idxB)) { y <- Y[, idxB[q]]; ok <- !is.na(y); LB[ok, ] <- LB[ok, ] + t(log(thB[[q]][, y[ok], drop = FALSE])) }
+    lp <- LA[, aOf, drop = FALSE] + LB[, key, drop = FALSE] + matrix(log(pc), N, C, byrow = TRUE)
+    mx <- apply(lp, 1, max); ll <- sum(mx + log(rowSums(exp(lp - mx))))
+    post <- exp(lp - mx); post <- post / rowSums(post); pc <- colMeans(post)
+    pA <- sapply(seq_len(Ka), function(a) rowSums(post[, aOf == a, drop = FALSE]))
+    pK <- sapply(seq_len(2 * Kb), function(k) rowSums(post[, key == k, drop = FALSE]))
+    thA <- lapply(seq_along(idxA), function(q) { y <- Y[, idxA[q]]; ok <- !is.na(y)
+      m <- sapply(seq_len(R[idxA[q]]), function(cc) colSums(pA[ok & y == cc, , drop = FALSE])); m <- matrix(m, Ka) + 1e-10; m / rowSums(m) })
+    thB <- lapply(seq_along(idxB), function(q) { y <- Y[, idxB[q]]; ok <- !is.na(y)
+      m <- sapply(seq_len(R[idxB[q]]), function(cc) colSums(pK[ok & y == cc, , drop = FALSE])); m <- matrix(m, 2 * Kb) + 1e-10; m / rowSums(m) })
+    if (abs(ll - ll_old) < tol) break; ll_old <- ll
+  }
+  npar <- (C - 1) + Ka * sum(R[idxA] - 1) + 2 * Kb * sum(R[idxB] - 1)
+  list(ll = ll, P = pc, post = post, thA = thA, thB = thB, npar = npar, bic = -2 * ll + log(N) * npar,
+       aOf = aOf, bOf = bOf, key = key, Ka = Ka, Kb = Kb)
+}
+RUN_9A <- !file.exists("step09_olcum_varsayimi.csv")
+if (RUN_9A) {
+  pk <- f9$thA[[which(colnames(YC5)[iA5] == "N_PC")]][, 2]
+  man <- which(pk < THR6); gA <- ifelse(seq_len(f9$Ka) %in% man, 2, 1)  # 2 = manual profile
+  bs <- shift_b(f9)
+  pM <- rowSums(f9$post[, f9$aOf %in% man, drop = FALSE])               # P(manual profile | responses)
+  # (i) residual check: observed unpaid rate by item x B class, by group
+  res <- list()
+  for (q in seq_along(iB5)) {
+    j <- iB5[q]; y <- YC5[, j]; ok <- !is.na(y)                          # only respondents who need the item
+    for (b in seq_len(f9$Kb)) {
+      pb <- rowSums(f9$post[, f9$bOf == b, drop = FALSE])
+      wM <- (pb * pM)[ok]; wO <- (pb * (1 - pM))[ok]; u <- (y[ok] == 2)
+      res[[length(res) + 1]] <- data.frame(madde = colnames(YC5)[j], B_sinif = b, aktaran = b == bs,
+        model = f9$thB[[q]][b, 2], gozlenen_el = sum(wM * u) / sum(wM), gozlenen_diger = sum(wO * u) / sum(wO),
+        n_etkin_el = sum(wM), n_etkin_diger = sum(wO))
+    }
+  }
+  res <- do.call(rbind, res); res$fark_el_diger <- res$gozlenen_el - res$gozlenen_diger
+  # (ii) relaxed model (Route A: start from the selected solution; Route B: small perturbation)
+  fd <- tryCatch(lca2d_em_dif(YC5, iA5, iB5, 5, 4, gA, init = list(P = f9$P, thA = f9$thA, thB = f9$thB)), error = function(e) NULL)
+  if (is.null(fd)) fd <- tryCatch({ set.seed(9090); jit <- lapply(f9$thB, function(m) { m <- m + matrix(stats::runif(length(m), 0, .02), nrow(m)); m / rowSums(m) })
+    lca2d_em_dif(YC5, iA5, iB5, 5, 4, gA, init = list(P = f9$P, thA = f9$thA, thB = jit)) }, error = function(e) NULL)
+  ozet <- data.frame(model = "secilen_5x4_esit_olcum", LL = f9$ll, npar = f9$npar, BIC = f9$bic,
+                     t(grad_gen(f9, YC5, iA5))[, c("P_aktaran_el", "P_aktaran_diger", "gradyan"), drop = FALSE])
+  if (!is.null(fd)) {
+    isM <- fd$aOf %in% man; pa_m <- sum(fd$P[isM]); pa_o <- sum(fd$P[!isM])
+    g_d <- sum(fd$P[isM & fd$bOf == bs]) / pa_m - sum(fd$P[!isM & fd$bOf == bs]) / pa_o
+    ozet <- rbind(ozet, data.frame(model = "gevsetilmis_B_olcumu_el_vs_diger", LL = fd$ll, npar = fd$npar, BIC = fd$bic,
+      P_aktaran_el = sum(fd$P[isM & fd$bOf == bs]) / pa_m, P_aktaran_diger = sum(fd$P[!isM & fd$bOf == bs]) / pa_o, gradyan = g_d))
+    # B class parameters in the relaxed model: other (1) vs manual (2) group
+    th_d <- do.call(rbind, lapply(seq_along(iB5), function(q) data.frame(madde = colnames(YC5)[iB5[q]], B_sinif = seq_len(f9$Kb),
+      P_odenmeyen_diger = fd$thB[[q]][seq_len(f9$Kb), 2], P_odenmeyen_el = fd$thB[[q]][f9$Kb + seq_len(f9$Kb), 2])))
+    th_d$fark <- th_d$P_odenmeyen_el - th_d$P_odenmeyen_diger
+    num <- sapply(th_d, is.numeric); th_d[num] <- lapply(th_d[num], round, 4)
+    write_out(th_d, "step09_gevsetilmis_B_parametreleri.csv")
+  }
+  ozet$LRT_df <- c(NA, if (nrow(ozet) > 1) ozet$npar[2] - ozet$npar[1])
+  ozet$LRT <- c(NA, if (nrow(ozet) > 1) 2 * (ozet$LL[2] - ozet$LL[1]))
+  num <- sapply(res, is.numeric); res[num] <- lapply(res[num], round, 4)
+  num <- sapply(ozet, is.numeric); ozet[num] <- lapply(ozet[num], round, 4)
+  write_out(res, "step09_artik_kontrol.csv")
+  write_out(ozet, "step09_olcum_varsayimi.csv")
+}
+
+# ---------- 9b. identification: many random starts ----------
+RUN_9B <- !file.exists("step09_cok_baslangic_ozet.csv")
+if (RUN_9B) {
+  runs <- list(); best65 <- NULL
+  for (kk in list(c(5, 4), c(6, 5))) {
+    for (s in seq_len(NSTART9)) {
+      f <- tryCatch(lca2d_em(YC5, iA5, iB5, kk[1], kk[2], nrep = 1, seed0 = 50000 + 100 * s), error = function(e) NULL)
+      if (is.null(f)) next
+      g <- grad_gen(f, YC5, iA5)
+      runs[[length(runs) + 1]] <- data.frame(model = paste0(kk[1], "x", kk[2]), baslangic = s, LL = f$ll, BIC = f$bic,
+                                             gradyan = g[["gradyan"]], el_payi = g[["el_payi"]])
+      if (all(kk == c(6, 5)) && (is.null(best65) || f$ll > best65$ll)) best65 <- f
+    }
+    message("step09: ", kk[1], "x", kk[2], " ", NSTART9, " baslangic tamam")
+  }
+  runs <- do.call(rbind, runs)
+  runs$en_iyi_LL <- stats::ave(runs$LL, runs$model, FUN = max)
+  runs$en_iyiye_ulasti <- abs(runs$LL - runs$en_iyi_LL) < 0.01
+  write_out(runs, "step09_cok_baslangic.csv")
+  oz <- do.call(rbind, lapply(split(runs, runs$model), function(d) data.frame(model = d$model[1], n_baslangic = nrow(d),
+         en_iyi_LL = max(d$LL), n_en_iyi = sum(d$en_iyiye_ulasti), pct_en_iyi = 100 * mean(d$en_iyiye_ulasti),
+         gradyan_en_iyi_min = min(d$gradyan[d$en_iyiye_ulasti]), gradyan_en_iyi_max = max(d$gradyan[d$en_iyiye_ulasti]),
+         LL_ikinci = if (any(!d$en_iyiye_ulasti)) max(d$LL[!d$en_iyiye_ulasti]) else NA,
+         gradyan_tum_min = min(d$gradyan), gradyan_tum_max = max(d$gradyan))))
+  num <- sapply(oz, is.numeric); oz[num] <- lapply(oz[num], round, 4)
+  write_out(oz, "step09_cok_baslangic_ozet.csv")
+  # 6 x 5 profiles and cross-table with 5 x 4
+  if (!is.null(best65)) {
+    shA <- sapply(seq_len(best65$Ka), function(a) sum(best65$P[best65$aOf == a]))
+    shB <- sapply(seq_len(best65$Kb), function(b) sum(best65$P[best65$bOf == b]))
+    prA <- do.call(rbind, lapply(seq_along(iA5), function(q) data.frame(boyut = "ihtiyac", madde = colnames(YC5)[iA5[q]],
+             t(setNames(best65$thA[[q]][, 2], paste0("sinif_", seq_len(best65$Ka)))))))
+    prB <- do.call(rbind, lapply(seq_along(iB5), function(q) data.frame(boyut = "karsilama", madde = colnames(YC5)[iB5[q]],
+             t(setNames(c(best65$thB[[q]][, 2], rep(NA, best65$Ka - best65$Kb)), paste0("sinif_", seq_len(best65$Ka)))))))
+    pay <- rbind(data.frame(boyut = "ihtiyac", madde = "sinif_payi", t(setNames(shA, paste0("sinif_", seq_len(best65$Ka))))),
+                 data.frame(boyut = "karsilama", madde = "sinif_payi", t(setNames(c(shB, rep(NA, best65$Ka - best65$Kb)), paste0("sinif_", seq_len(best65$Ka))))))
+    pr <- rbind(pay, prA, prB); num <- sapply(pr, is.numeric); pr[num] <- lapply(pr[num], round, 4)
+    write_out(pr, "step09_profil_6x5.csv")
+    if (is.null(f9)) f9 <- lca2d_em(YC5, iA5, iB5, 5, 4, nrep = 10)
+    modA <- function(f) apply(sapply(seq_len(f$Ka), function(a) rowSums(f$post[, f$aOf == a, drop = FALSE])), 1, which.max)
+    modB <- function(f) apply(sapply(seq_len(f$Kb), function(b) rowSums(f$post[, f$bOf == b, drop = FALSE])), 1, which.max)
+    cA <- data.frame(boyut = "ihtiyac", as.data.frame(table(modA(f9), modA(best65))))
+    cB <- data.frame(boyut = "karsilama", as.data.frame(table(modB(f9), modB(best65))))
+    names(cA) <- names(cB) <- c("boyut", "sinif_5x4", "sinif_6x5", "N")
+    cr <- rbind(cA, cB); cr <- cr[cr$N > 0, ]
+    cr$ARI <- ifelse(cr$boyut == "ihtiyac", ari(modA(f9), modA(best65)), ari(modB(f9), modB(best65)))
+    write_out(cr, "step09_5x4_6x5_capraz.csv")
+  }
+}
+
+# ---------- 9c. strictest threshold: c = 4 ----------
+RUN_9C <- !file.exists("step09_esik4.csv")
+if (RUN_9C) {
+  YC4 <- make_YC(w, 4)                                                   # 1 = not paid at all, 0 = partly or fully paid
+  rr <- list(fit_summary(f9, YC5, "esik2_secilen_5x4", iA5, iB5))
+  f <- tryCatch(lca2d_em(YC4, iA5, iB5, 5, 4, nrep = 10), error = function(e) NULL)                 # Route B: random
+  f0 <- tryCatch(lca2d_em(YC4, iA5, iB5, 5, 4, nrep = 1, init = list(P = f9$P, thA = f9$thA, thB = f9$thB)), error = function(e) NULL)  # Route A
+  if (!is.null(f0) && (is.null(f) || f0$ll > f$ll)) f <- f0                # keep the better solution
+  if (!is.null(f)) rr[[2]] <- fit_summary(f, YC4, "esik4_5x4", iA5, iB5)
+  rr <- do.call(rbind, rr); rr$pay_esik4_odenmeyen <- c(NA, mean(YC4[, iB5] == 2, na.rm = TRUE))
+  num <- sapply(rr, is.numeric); rr[num] <- lapply(rr[num], round, 4)
+  write_out(rr, "step09_esik4.csv")
+}
+
+# ---------- 9d. 38 excluded respondents ----------
+RUN_9D <- !file.exists("step09_dislanan.csv")
+if (RUN_9D) {
+  allp <- d2[!is.na(d2$Job_Paid_Work) & d2$Job_Paid_Work == 1, ]        # all respondents in paid work (2,990)
+  excl <- !(rownames(allp) %in% rownames(w))                             # excluded from the analysis
+  vars <- intersect(c("Country", "Job_Employed", "Education_3Lvl", "Age_Groups", "Gender", "Occupation_SkillGroup"), names(allp))
+  out <- do.call(rbind, lapply(vars, function(v) {
+    x <- as.character(allp[[v]]); x[is.na(x)] <- "eksik"
+    tb <- table(x, ifelse(excl, "dislanan", "analiz"))
+    pr <- sweep(tb, 2, colSums(tb), "/")
+    data.frame(degisken = v, kategori = rownames(tb), n_analiz = tb[, "analiz"], n_dislanan = tb[, "dislanan"],
+               pct_analiz = round(100 * pr[, "analiz"], 1), pct_dislanan = round(100 * pr[, "dislanan"], 1),
+               p_fisher = suppressWarnings(tryCatch(stats::fisher.test(tb, simulate.p.value = TRUE, B = 5000)$p.value, error = function(e) NA)))
+  }))
+  miss_need <- rowSums(is.na(allp[excl, need_v])); miss_task <- rowSums(is.na(allp[excl, tsk$f]))
+  out <- rbind(out, data.frame(degisken = "eksik_tur", kategori = c("ihtiyac_sorusu_eksik", "gorev_sorusu_eksik"),
+                               n_analiz = NA, n_dislanan = c(sum(miss_need > 0), sum(miss_task > 0)),
+                               pct_analiz = NA, pct_dislanan = NA, p_fisher = NA))
+  write_out(out, "step09_dislanan.csv")
+}
+
+# ---------- 9e. Monte Carlo: S10-S12 ----------
+sim9 <- function(sc) {
+  N <- sc$N
+  prof <- sample.int(nrow(sc$need), N, replace = TRUE, prob = sc$share)  # true need profile
+  reg  <- vapply(prof, function(k) sample.int(ncol(sc$regp), 1, prob = sc$regp[k, ]), 1L)
+  grp  <- stats::rbinom(N, 1, 0.5) + 1                                   # S12: two "countries"
+  Pu <- t(vapply(seq_len(N), function(i) sc$unp_fun(prof[i], reg[i], grp[i]), numeric(8)))  # person-level unpaid probability
+  nd <- matrix(stats::rbinom(N * 8, 1, sc$need[prof, ]), N, 8)
+  un <- matrix(stats::rbinom(N * 8, 1, Pu), N, 8)
+  YMs <- ifelse(nd == 0, 1, un + 1); YCs <- cbind(nd + 1, ifelse(nd == 1, un + 1, NA))
+  colnames(YMs) <- paste0("M", 1:8); colnames(YCs) <- c(paste0("N", 1:8), paste0("C", 1:8))
+  list(man = as.integer(prof %in% sc$manual), sh = as.integer(reg == sc$shift), YM = YMs, YC = YCs)
+}
+u_base <- function(reg) if (reg == 2) rep(.45, 8) else rep(.05, 8)       # as in S2: generous 0.05, cost-shifting 0.45
+scen9 <- list(
+  S10_ihtiyaca_gore_odeme = mod7(unp_fun = function(p, r, g) if (p == 2) (if (r == 2) rep(.60, 8) else rep(.10, 8)) else u_base(r)),
+  S11_iki_maddede_etkilesim = mod7(unp_fun = function(p, r, g) { u <- u_base(r); if (p == 2) u[c(1, 5)] <- if (r == 2) .70 else .20; u }),
+  S12_ulkeye_gore_odeme = mod7(unp_fun = function(p, r, g) if (g == 2) (if (r == 2) rep(.55, 8) else rep(.15, 8)) else u_base(r)))
+RUN_9E <- !file.exists("step09_montecarlo.csv")
+if (RUN_9E) {
+  mc9 <- list()
+  for (s in seq_along(scen9)) for (r in seq_len(MC_R9)) {
+    set.seed(90000 + 100 * s + r); sc <- scen9[[s]]; sm <- sim9(sc)
+    gap <- function(p) mean(p[sm$man == 1]) - mean(p[sm$man == 0])
+    fM <- run_lca(sm$YM, 2, NREP7_MC); fC <- run_lca(sm$YC, 4, NREP7_MC)
+    f2 <- tryCatch(lca2d_em(sm$YC, 1:8, 9:16, 2, 2, nrep = NREP7_MC, maxit = 1500, tol = 1e-6), error = function(e) NULL)
+    g2k <- g2m <- NA
+    if (!is.null(f2)) {
+      b2 <- shift_b(f2); g2k <- gap(rowSums(f2$post[, f2$bOf == b2, drop = FALSE]))
+      pPC2 <- f2$thA[[4]][, 2]; am <- which(pPC2 < .5); if (!length(am) || length(am) == 2) am <- which.min(pPC2)
+      pa <- sapply(1:2, function(a) sum(f2$P[f2$aOf == a])); isM <- f2$aOf %in% am
+      g2m <- sum(f2$P[isM & f2$bOf == b2]) / sum(pa[am]) - sum(f2$P[!isM & f2$bOf == b2]) / sum(pa[-am])
+    }
+    mc9[[length(mc9) + 1]] <- data.frame(senaryo = names(scen9)[s], tekrar = r, N = sc$N, gercek = gap(sm$sh),
+      M = gap(shift_post4(fM, 1:8)), C = gap(shift_post4(fC, 9:16)), C2B_kisi = g2k, C2B_model = g2m)
+    if (r %% 10 == 0) message("step09 MC: ", names(scen9)[s], " ", r, "/", MC_R9)
+  }
+  mc9 <- do.call(rbind, mc9)
+  write_out(mc9, "step09_montecarlo_tekrarlar.csv")
+  long <- do.call(rbind, lapply(c("M", "C", "C2B_kisi", "C2B_model"), function(m)
+    do.call(rbind, lapply(split(mc9, mc9$senaryo), function(d) {
+      e <- d[[m]] - d$gercek; e <- e[!is.na(e)]
+      data.frame(senaryo = d$senaryo[1], yontem = m, gercek = mean(d$gercek), ort_tahmin = mean(d[[m]], na.rm = TRUE),
+                 ort_yanlilik = mean(e), MC_SE_yanlilik = stats::sd(e) / sqrt(length(e)), sd = stats::sd(d[[m]], na.rm = TRUE),
+                 RMSE = sqrt(mean(e^2)), hata_gt_025_pct = 100 * mean(abs(e) > .25),
+                 yakalanan_pay = mean(d[[m]], na.rm = TRUE) / mean(d$gercek), n = length(e)) }))))
+  num <- sapply(long, is.numeric); long[num] <- lapply(long[num], round, 3)
+  write_out(long, "step09_montecarlo.csv")
+}
+message("step09 tamamlandi.")
+
+# =====================================================================
+# STEP10 - model selection and further checks
+#   10a. Model selection: 15 models + 3 larger (7x5, 6x6, 7x6); BIC, AIC, AIC3, CAIC, SABIC, ICL-BIC,
+#        entropy, smallest class, BVR, gradient under two definitions
+#   10b. bootstrap for the 6 x 5 model (gradient interval)
+#   10c. Model-free observed measure: share of needed items not fully paid
+#        (conditional and merged coding; by computer need, ISCO and skill groups)
+#   10d. Simulation S13: data generated from the selected 5 x 4 model, model refitted
+#   10e. Top 10 BVRs, equal country weights, split of the 1D manual class at K = 7 and 8
+# Route A: supplied starts / poLCA; Route B: random starts / own EM
+# =====================================================================
+NREP10  <- 10                                                            # observed data: number of starts
+B10     <- 500                                                           # 10b: bootstrap replicates for 6 x 5
+MC_R10  <- 50                                                            # 10d: S13 replicates
+B_ALL   <- 1000                                                          # same number of bootstrap replicates throughout
+B10_OBS <- B_ALL                                                         # 10c: bootstrap for the observed measure
+needs_boot <- function(fn, B = B_ALL) {                                  # TRUE if the file is missing or used a different B
+  if (!file.exists(fn)) return(TRUE)
+  d <- tryCatch(rd(fn), error = function(e) NULL)
+  is.null(d) || !("n_boot" %in% names(d)) || !isTRUE(all(d$n_boot == B))
+}
+
+grad_old <- function(ft, Y, iA) {                                        # narrow definition: single class with the lowest computer need
+  pk <- ft$thA[[which(colnames(Y)[iA] == "N_PC")]][, 2]; man <- which.min(pk); bs <- shift_b(ft)
+  isM <- ft$aOf %in% man
+  sum(ft$P[isM & ft$bOf == bs]) / sum(ft$P[isM]) - sum(ft$P[!isM & ft$bOf == bs]) / sum(ft$P[!isM])
+}
+info_crit <- function(f, N) {                                            # information criteria
+  EN <- -sum(f$post * log(pmax(f$post, 1e-300)))                         # classification entropy (raw)
+  c(AIC = -2 * f$ll + 2 * f$npar, AIC3 = -2 * f$ll + 3 * f$npar, CAIC = -2 * f$ll + (log(N) + 1) * f$npar,
+    SABIC = -2 * f$ll + log((N + 2) / 24) * f$npar, ICL_BIC = f$bic + 2 * EN)
+}
+f10 <- NULL
+need_f10 <- any(!file.exists(c("step10_bvr_ilk10.csv", "step10_ulke_esit_agirlik.csv", "step10_s13_montecarlo.csv")))
+if (need_f10) f10 <- lca2d_em(YC5, iA5, iB5, 5, 4, nrep = NREP10)       # selected model (same seeds, same solution)
+
+# ---------- 10a. model selection ----------
+RUN_10A <- !file.exists("step10_model_secimi.csv")
+f65 <- NULL
+if (RUN_10A) {
+  grid <- c(lapply(2:5, function(a) lapply(2:4, function(b) c(a, b))), list(list(c(6, 4), c(5, 5), c(6, 5), c(7, 5), c(6, 6), c(7, 6))))
+  grid <- unlist(grid, recursive = FALSE)
+  ms <- list()
+  for (kk in grid) {
+    f <- tryCatch(lca2d_em(YC5, iA5, iB5, kk[1], kk[2], nrep = NREP10), error = function(e) NULL)
+    if (is.null(f)) next
+    if (all(kk == c(6, 5))) f65 <- f
+    mA <- sapply(seq_len(f$Ka), function(a) sum(f$P[f$aOf == a])); mB <- sapply(seq_len(f$Kb), function(b) sum(f$P[f$bOf == b]))
+    ms[[length(ms) + 1]] <- data.frame(model = paste0(kk[1], "x", kk[2]), Ka = kk[1], Kb = kk[2], LL = f$ll, npar = f$npar, BIC = f$bic,
+      t(info_crit(f, nrow(YC5))), entropi = entropy(f$post), en_kucuk_A = min(mA), en_kucuk_B = min(mB),
+      t(bvr_sum(bvr_fun(YC5, f))), gradyan_yeni = grad_gen(f, YC5, iA5)[["gradyan"]], gradyan_eski = grad_old(f, YC5, iA5))
+    message("step10a: ", kk[1], "x", kk[2], " tamam")
+  }
+  ms <- do.call(rbind, ms)
+  for (k in c("BIC", "AIC", "AIC3", "CAIC", "SABIC", "ICL_BIC")) ms[[paste0("en_iyi_", k)]] <- ms[[k]] == min(ms[[k]])
+  ms$en_iyi_BIC_kucuk_sinif_kurali <- ms$BIC == min(ms$BIC[pmin(ms$en_kucuk_A, ms$en_kucuk_B) >= 0.05])
+  num <- sapply(ms, is.numeric); ms[num] <- lapply(ms[num], round, 4)
+  write_out(ms, "step10_model_secimi.csv")
+}
+
+# ---------- 10b. 6 x 5 bootstrap ----------
+RUN_10B <- !file.exists("step10_bootstrap_6x5_ci.csv")
+if (RUN_10B) {
+  if (is.null(f65)) f65 <- lca2d_em(YC5, iA5, iB5, 6, 5, nrep = NREP10)
+  init65 <- list(P = f65$P, thA = f65$thA, thB = f65$thB); bt <- list(); t0 <- Sys.time()
+  for (b in seq_len(B10)) {
+    set.seed(61000 + b); idx <- sample.int(nrow(YC5), replace = TRUE)
+    fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, 6, 5, nrep = 1, init = init65, tol = 1e-6), error = function(e) NULL)   # Route A
+    if (is.null(fb)) fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, 6, 5, nrep = 3, tol = 1e-6), error = function(e) NULL)  # Route B
+    if (is.null(fb)) next
+    g <- grad_gen(fb, YC5, iA5)
+    bt[[length(bt) + 1]] <- data.frame(tekrar = b, gradyan = g[["gradyan"]], P_aktaran_el = g[["P_aktaran_el"]],
+                                       P_aktaran_diger = g[["P_aktaran_diger"]], gradyan_eski = grad_old(fb, YC5, iA5))
+    if (b %% 50 == 0) message("6x5 bootstrap ", b, "/", B10, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+  }
+  bt <- do.call(rbind, bt); write_out(bt, "step10_bootstrap_6x5_tekrarlar.csv")
+  g0 <- grad_gen(f65, YC5, iA5)
+  ci <- do.call(rbind, lapply(names(bt)[-1], function(v) data.frame(olcu = v,
+          tahmin = c(gradyan = g0[["gradyan"]], P_aktaran_el = g0[["P_aktaran_el"]], P_aktaran_diger = g0[["P_aktaran_diger"]],
+                     gradyan_eski = grad_old(f65, YC5, iA5))[[v]],
+          lo_2.5 = stats::quantile(bt[[v]], .025), hi_97.5 = stats::quantile(bt[[v]], .975),
+          pct_sifir_alti = 100 * mean(bt[[v]] <= 0), n_basarili = nrow(bt))))
+  num <- sapply(ci, is.numeric); ci[num] <- lapply(ci[num], round, 4)
+  write_out(ci, "step10_bootstrap_6x5_ci.csv")
+}
+
+# ---------- 10c. model-free observed measure ----------
+RUN_10C <- needs_boot("step10_gozlenen_olcut.csv")
+if (RUN_10C) {
+  ND <- sapply(need_v, function(v) w[[v]] == 1)                          # needed (TRUE/FALSE)
+  PD <- sapply(paid_v, function(v) w[[v]])                               # payment (1-4, NA if not needed)
+  U2 <- ND & !is.na(PD) & PD >= 2; U3 <- ND & !is.na(PD) & PD >= 3       # not fully / mostly not paid
+  nN <- rowSums(ND)
+  meas <- list(kosullu_c2 = ifelse(nN > 0, rowSums(U2) / nN, NA),        # share among needed items
+               kosullu_c3 = ifelse(nN > 0, rowSums(U3) / nN, NA),
+               birlesik_c2 = rowSums(U2) / length(tools),                # over all 8 items (not needed = paid)
+               birlesik_c3 = rowSums(U3) / length(tools),
+               yuksek_yuk_c2 = ifelse(nN > 0, as.numeric(rowSums(U2) / nN >= 0.75), NA))  # >= 75% of needed items not fully paid
+  isco <- suppressWarnings(as.numeric(as.character(w$ISCO_1D))); skl <- suppressWarnings(as.numeric(as.character(w$Occupation_SkillGroup)))
+  emp <- !is.na(w$Job_Employed) & w$Job_Employed == 1; pc0 <- w$Tools_PC == 0
+  grp <- list(
+    PC_gerekmiyor_vs_gerekiyor = list(a = pc0, b = !pc0),
+    PC_gerekmiyor_vs_gerekiyor_ucretli = list(a = pc0 & emp, b = !pc0 & emp),
+    ISCO_5_9_vs_1_4 = list(a = !is.na(isco) & isco >= 5, b = !is.na(isco) & isco >= 1 & isco <= 4),
+    ISCO_7_9_vs_1_3 = list(a = !is.na(isco) & isco >= 7, b = !is.na(isco) & isco >= 1 & isco <= 3),
+    Beceri_1_2_vs_3_4 = list(a = !is.na(skl) & skl <= 2, b = !is.na(skl) & skl >= 3))
+  set.seed(10010); out <- list()
+  for (gn in names(grp)) for (mn in names(meas)) {
+    x <- meas[[mn]]; ia <- which(grp[[gn]]$a & !is.na(x)); ib <- which(grp[[gn]]$b & !is.na(x))
+    bt <- replicate(B10_OBS, mean(x[sample(ia, replace = TRUE)]) - mean(x[sample(ib, replace = TRUE)]))
+    out[[length(out) + 1]] <- data.frame(karsilastirma = gn, olcu = mn, N_a = length(ia), N_b = length(ib),
+      ort_a = mean(x[ia]), ort_b = mean(x[ib]), fark = mean(x[ia]) - mean(x[ib]),
+      lo_2.5 = stats::quantile(bt, .025), hi_97.5 = stats::quantile(bt, .975))
+  }
+  out <- do.call(rbind, out); num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
+  out$n_boot <- B10_OBS; write_out(out, "step10_gozlenen_olcut.csv")
+  # by item: conditional and merged prevalence (c = 2) for workers with and without computer need
+  it <- do.call(rbind, lapply(seq_along(tools), function(k) do.call(rbind, lapply(c(TRUE, FALSE), function(g) {
+    i <- which(pc0 == g); ex <- i[ND[i, k]]
+    data.frame(madde = tools[k], grup = if (g) "PC_gerekmiyor" else "PC_gerekiyor", N = length(i), N_maruz = length(ex),
+               ihtiyac_orani = mean(ND[i, k]), kosullu_c2 = if (length(ex)) mean(U2[ex, k]) else NA, birlesik_c2 = mean(U2[i, k])) }))))
+  num <- sapply(it, is.numeric); it[num] <- lapply(it[num], round, 4)
+  write_out(it, "step10_gozlenen_madde.csv")
+}
+
+# ---------- 10d. simulation S13 ----------
+RUN_10D <- !file.exists("step10_s13_montecarlo.csv")
+if (RUN_10D) {
+  pkT <- f10$thA[[which(colnames(YC5)[iA5] == "N_PC")]][, 2]; manT <- which(pkT < THR6); bsT <- shift_b(f10)
+  true_init <- list(P = f10$P, thA = f10$thA, thB = f10$thB)
+  s13 <- list(); t0 <- Sys.time()
+  for (r in seq_len(MC_R10)) {
+    set.seed(130000 + r); N <- nrow(YC5)
+    cell <- sample.int(length(f10$P), N, replace = TRUE, prob = f10$P)  # true cell (a, b)
+    a <- f10$aOf[cell]; b <- f10$bOf[cell]
+    nd <- sapply(seq_along(tools), function(j) stats::rbinom(N, 1, f10$thA[[j]][a, 2]))
+    un <- sapply(seq_along(tools), function(j) stats::rbinom(N, 1, f10$thB[[j]][b, 2]))
+    YCs <- cbind(nd + 1, ifelse(nd == 1, un + 1, NA)); colnames(YCs) <- colnames(YC5)
+    YMs <- ifelse(nd == 0, 1, un + 1); colnames(YMs) <- paste0("M_", tools)
+    man <- a %in% manT; sh <- b == bsT
+    gap <- function(p) mean(p[man]) - mean(p[!man])
+    fr <- tryCatch(lca2d_em(YCs, iA5, iB5, 5, 4, nrep = NREP10), error = function(e) NULL)            # Route B: random
+    ft <- tryCatch(lca2d_em(YCs, iA5, iB5, 5, 4, nrep = 1, init = true_init), error = function(e) NULL)  # Route A: true values
+    fM <- run_lca(YMs, 2, 5); fC <- run_lca(YCs, 4, 5)
+    g2 <- function(f) if (is.null(f)) c(NA, NA) else c(grad_gen(f, YCs, iA5)[["gradyan"]],
+                                                       gap(rowSums(f$post[, f$bOf == shift_b(f), drop = FALSE])))
+    s13[[r]] <- data.frame(tekrar = r, gercek = gap(sh), gercek_model = sum(f10$P[f10$aOf %in% manT & f10$bOf == bsT]) / sum(f10$P[f10$aOf %in% manT]) -
+                             sum(f10$P[!(f10$aOf %in% manT) & f10$bOf == bsT]) / sum(f10$P[!(f10$aOf %in% manT)]),
+      M = gap(shift_post4(fM, seq_along(tools))), C = gap(shift_post4(fC, 8 + seq_along(tools))),
+      C2B_model = g2(fr)[1], C2B_kisi = g2(fr)[2], C2B_model_gercek_bas = g2(ft)[1],
+      LL_rastgele = if (is.null(fr)) NA else fr$ll, LL_gercek_bas = if (is.null(ft)) NA else ft$ll)
+    if (r %% 5 == 0) message("S13 ", r, "/", MC_R10, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+  }
+  s13 <- do.call(rbind, s13)
+  s13$rastgele_en_iyiye_ulasti <- s13$LL_rastgele >= s13$LL_gercek_bas - 0.01   # are 10 random starts sufficient?
+  write_out(s13, "step10_s13_tekrarlar.csv")
+  oz <- do.call(rbind, lapply(c("M", "C", "C2B_model", "C2B_kisi", "C2B_model_gercek_bas"), function(m) {
+    e <- s13[[m]] - s13$gercek; e <- e[!is.na(e)]
+    data.frame(yontem = m, gercek = mean(s13$gercek), ort_tahmin = mean(s13[[m]], na.rm = TRUE), ort_yanlilik = mean(e),
+               MC_SE = stats::sd(e) / sqrt(length(e)), RMSE = sqrt(mean(e^2)), hata_gt_025_pct = 100 * mean(abs(e) > .25), n = length(e)) }))
+  oz$pct_rastgele_en_iyi <- 100 * mean(s13$rastgele_en_iyiye_ulasti, na.rm = TRUE)
+  num <- sapply(oz, is.numeric); oz[num] <- lapply(oz[num], round, 4)
+  write_out(oz, "step10_s13_montecarlo.csv")
+}
+
+# ---------- 10e. BVR, equal country weights, split of the 1D class ----------
+if (!file.exists("step10_bvr_ilk10.csv")) {
+  bv <- bvr_fun(YC5, f10); bv <- utils::head(bv[order(-bv$BVR), ], 10); bv$BVR <- round(bv$BVR, 2)
+  write_out(bv, "step10_bvr_ilk10.csv")
+}
+if (!file.exists("step10_ulke_esit_agirlik.csv")) {
+  nc <- table(w$Country); we <- as.numeric(1 / nc[w$Country])           # equal total weight per country
+  ue <- rbind(data.frame(agirlik = "agirliksiz", t(grad_gen(f10, YC5, iA5))),
+              data.frame(agirlik = "ulkelere_esit", t(grad_gen(f10, YC5, iA5, wt = we))))
+  num <- sapply(ue, is.numeric); ue[num] <- lapply(ue[num], round, 4)
+  write_out(ue, "step10_ulke_esit_agirlik.csv")
+}
+if (!file.exists("step10_1d_bolunme.csv")) {
+  set.seed(2024); f3 <- run_lca(YC5, 3, nrep = NREP10); h <- hidden_id(f3)
+  m3 <- apply(f3$post, 1, which.max) == h                                 # 1D manual class (K = 3)
+  out <- list()
+  for (K in c(6, 7, 8)) {
+    set.seed(3000 + K); fK <- run_lca(YC5, K, nrep = NREP10); mK <- apply(fK$post, 1, which.max)
+    pc <- pk2(fK, which(tools == "PC"))                                   # computer need in each class
+    unp <- sapply(seq_len(K), function(k) mean(sapply(8 + seq_along(tools), function(j) pk2(fK, j)[k])))  # mean unpaid probability
+    tb <- table(mK[m3])
+    out[[length(out) + 1]] <- data.frame(K = K, sinif = as.integer(names(tb)), n_1D_el_emegi = as.integer(tb),
+      sinif_payi = fK$P[as.integer(names(tb))], P_PC_ihtiyac = pc[as.integer(names(tb))], ort_odenmeme = unp[as.integer(names(tb))],
+      sinif_toplam_n = as.integer(table(factor(mK, seq_len(K)))[as.integer(names(tb))]), yol = fK$yol)
+  }
+  out <- do.call(rbind, out); num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
+  write_out(out, "step10_1d_bolunme.csv")
+}
+message("step10 tamamlandi.")
+
+# =====================================================================
+# STEP11 - selected 6 x 5 model (lowest BIC with every class >= 5%)
+#   11a. refit 6 x 5 (same seeds and solution as step10); profiles, cells, BVR, gradient (3 definitions)
+#   11b. bootstrap: gradient (3 definitions) and ISCO difference; checkpoint every 25 replicates,
+#        resumes if interrupted
+#   11c. Observed occupation (ISCO): fixed-parameter posterior bootstrap and ISCO major groups
+#   11d. Subgroups: common measurement and separate models (country, UK weighted, employees), equal country weights
+#   11e. Sensitivity: drop each item (8 models), thresholds c = 3 and c = 4
+#   11f. Measurement assumption: residual check and relaxed model (B free by manual / other profile)
+#   11g. Compensation regimes vs auxiliary variables; cross-table with 1D (K = 3)
+#   11h. Digital-need definition (mean need for computer, phone and internet < 0.5),
+#        gradient under three definitions in 18 models
+#   11i. High-burden thresholds 50%, 75%, 100% (model-free measure)
+#   11j. S13: data generated from the 6 x 5 model, model refitted (50 replicates)
+# Route A: supplied starts / poLCA; Route B: random starts / own EM
+# =====================================================================
+KA11 <- 6; KB11 <- 5                                                     # model dimensions
+NREP11  <- 10                                                            # observed data: number of starts (as in step10)
+B11     <- 1000                                                          # bootstrap replicates
+B11_POST <- B_ALL                                                        # posterior bootstrap for the ISCO difference
+MC_R11  <- 50                                                            # S13 replicates
+DIG_KEYS <- c("N_PC", "N_Phone", "N_Internet")                           # digital need items
+
+# ---------- group definitions: low-computer-need classes ----------
+man_classes <- function(ft, Y, iA, def = c("ana", "dar", "dijital"), thr = THR6) {
+  def <- match.arg(def); nmA <- colnames(Y)[iA]
+  pkey <- function(k) { q <- which(nmA == k); if (length(q)) ft$thA[[q]][, 2] else NULL }
+  if (def == "dijital") {                                                # digital score: mean of the available digital items
+    ps <- Filter(Negate(is.null), lapply(DIG_KEYS, pkey))
+    sc <- Reduce(`+`, ps) / length(ps)
+    man <- which(sc < thr); if (!length(man) || length(man) == ft$Ka) man <- which.min(sc)
+    return(man)
+  }
+  pk <- pkey("N_PC"); if (is.null(pk)) pk <- pkey("N_Internet")          # internet if the computer item is dropped
+  if (def == "dar") return(which.min(pk))
+  man <- which(pk < thr); if (!length(man) || length(man) == ft$Ka) man <- which.min(pk)
+  man
+}
+grad_def <- function(ft, Y, iA, def = "ana", wt = NULL) {
+  N <- nrow(ft$post); if (is.null(wt)) wt <- rep(1, N); wt[is.na(wt)] <- 0
+  man <- man_classes(ft, Y, iA, def); bs <- shift_b(ft); isM <- ft$aOf %in% man
+  pa_m <- sum(wt * rowSums(ft$post[, isM, drop = FALSE])); pa_o <- sum(wt * rowSums(ft$post[, !isM, drop = FALSE]))
+  pab_m <- sum(wt * rowSums(ft$post[, isM & ft$bOf == bs, drop = FALSE]))
+  pab_o <- sum(wt * rowSums(ft$post[, !isM & ft$bOf == bs, drop = FALSE]))
+  c(P_aktaran_el = pab_m / pa_m, P_aktaran_diger = pab_o / pa_o, gradyan = pab_m / pa_m - pab_o / pa_o,
+    el_payi = pa_m / sum(wt), n_el_sinif = length(man))
+}
+grad3 <- function(ft, Y, iA, wt = NULL) {                                # three definitions side by side
+  a <- grad_def(ft, Y, iA, "ana", wt); d <- grad_def(ft, Y, iA, "dar", wt); g <- grad_def(ft, Y, iA, "dijital", wt)
+  c(gradyan_ana = a[["gradyan"]], P_aktaran_el = a[["P_aktaran_el"]], P_aktaran_diger = a[["P_aktaran_diger"]],
+    el_payi = a[["el_payi"]], n_el_sinif = a[["n_el_sinif"]],
+    gradyan_dar = d[["gradyan"]], gradyan_dijital = g[["gradyan"]], el_payi_dijital = g[["el_payi"]],
+    n_el_sinif_dijital = g[["n_el_sinif"]])
+}
+fit_sum11 <- function(f, Y, nm, iA) {
+  mA <- sapply(seq_len(f$Ka), function(a) sum(f$P[f$aOf == a])); mB <- sapply(seq_len(f$Kb), function(b) sum(f$P[f$bOf == b]))
+  data.frame(model = nm, Ka = f$Ka, Kb = f$Kb, LL = f$ll, npar = f$npar, BIC = f$bic, entropi = entropy(f$post),
+             en_kucuk_A = min(mA), en_kucuk_B = min(mB), t(bvr_sum(bvr_fun(Y, f))), t(grad3(f, Y, iA)))
+}
+rnd <- function(d, k = 4) { num <- sapply(d, is.numeric); d[num] <- lapply(d[num], round, k); d }
+
+out11 <- c("step11_18model_uc_tanim.csv", "step11_6x5_ozet.csv", "step11_isco.csv", "step11_altgrup.csv", "step11_duyarlilik.csv",
+           "step11_olcum_varsayimi.csv", "step11_dogrulama.csv", "step11_1d_capraz.csv", "step11_bootstrap_ci.csv",
+           "step11_s13_montecarlo.csv")
+f11 <- NULL
+if (any(!file.exists(out11)) || needs_boot("step11_isco.csv")) {
+  f11 <- lca2d_em(YC5, iA5, iB5, KA11, KB11, nrep = NREP11)              # same seeds as step10
+  message("step11: 6x5 kuruldu, LL = ", round(f11$ll, 2))
+}
+
+# ---------- 11a. main model: summary, profiles, cells, BVR ----------
+if (!file.exists("step11_6x5_ozet.csv")) {
+  mA <- sapply(seq_len(f11$Ka), function(a) sum(f11$P[f11$aOf == a])); mB <- sapply(seq_len(f11$Kb), function(b) sum(f11$P[f11$bOf == b]))
+  prA <- do.call(rbind, lapply(seq_along(iA5), function(q) data.frame(boyut = "A_ihtiyac", madde = colnames(YC5)[iA5[q]],
+           sinif = seq_len(f11$Ka), sinif_payi = mA, P_evet = f11$thA[[q]][, 2])))
+  prB <- do.call(rbind, lapply(seq_along(iB5), function(q) data.frame(boyut = "B_karsilama", madde = colnames(YC5)[iB5[q]],
+           sinif = seq_len(f11$Kb), sinif_payi = mB, P_evet = f11$thB[[q]][, 2])))
+  write_out(rnd(rbind(prA, prB)), "step11_6x5_profil.csv")
+  bs <- shift_b(f11)
+  ce <- data.frame(A_sinif = f11$aOf, B_sinif = f11$bOf, P_hucre = f11$P)
+  ce$P_B_given_A <- ce$P_hucre / mA[ce$A_sinif]
+  ce$el_ana <- ce$A_sinif %in% man_classes(f11, YC5, iA5, "ana")
+  ce$el_dijital <- ce$A_sinif %in% man_classes(f11, YC5, iA5, "dijital"); ce$aktaran_B <- ce$B_sinif == bs
+  write_out(rnd(ce), "step11_6x5_hucreler.csv")
+  bv <- bvr_fun(YC5, f11); write_out(rnd(utils::head(bv, 10), 2), "step11_bvr_ilk10.csv")
+  oz <- data.frame(fit_sum11(f11, YC5, "6x5_ana", iA5), t(info_crit(f11, nrow(YC5))))
+  oz$kisi_bazli_gradyan <- with(person_probs(f11, YC5, iA5), mean(p_shift[p_man >= .5]) - mean(p_shift[p_man < .5]))
+  write_out(rnd(oz), "step11_6x5_ozet.csv")
+}
+
+# ---------- 11b. bootstrap (with checkpoints) ----------
+if (!file.exists("step11_bootstrap_ci.csv")) {
+  isco <- suppressWarnings(as.numeric(as.character(w$ISCO_1D)))
+  init11 <- list(P = f11$P, thA = f11$thA, thB = f11$thB)
+  fpart <- "step11_bootstrap_tekrarlar.csv"
+  done <- if (file.exists(fpart)) rd(fpart) else NULL                    # resume from a previous run
+  start_b <- if (is.null(done)) 1 else max(done$tekrar) + 1
+  buf <- list(); t0 <- Sys.time()
+  if (start_b <= B11) for (b in start_b:B11) {
+    set.seed(61000 + b); idx <- sample.int(nrow(YC5), replace = TRUE)   # first 500 replicates as in step10
+    fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, KA11, KB11, nrep = 1, init = init11, tol = 1e-6), error = function(e) NULL)  # Route A
+    if (is.null(fb)) fb <- tryCatch(lca2d_em(YC5[idx, ], iA5, iB5, KA11, KB11, nrep = 3, tol = 1e-6), error = function(e) NULL) # Route B
+    if (!is.null(fb)) {
+      g <- grad3(fb, YC5, iA5); pb <- person_probs(fb, YC5, iA5); ib <- isco[idx]
+      dI <- mean(pb$p_shift[!is.na(ib) & ib >= 5]) - mean(pb$p_shift[!is.na(ib) & ib >= 1 & ib <= 4])
+      buf[[length(buf) + 1]] <- data.frame(tekrar = b, gradyan_ana = g[["gradyan_ana"]], P_aktaran_el = g[["P_aktaran_el"]],
+        P_aktaran_diger = g[["P_aktaran_diger"]], gradyan_dar = g[["gradyan_dar"]], gradyan_dijital = g[["gradyan_dijital"]],
+        ISCO_5_9_vs_1_4 = dI)
+    }
+    if (b %% 25 == 0 || b == B11) {                                      # checkpoint
+      if (length(buf)) { done <- rbind(done, do.call(rbind, buf)); buf <- list(); write_out(done, fpart) }
+      message("step11 bootstrap ", b, "/", B11, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+    }
+  }
+  bt <- rd(fpart); g0 <- grad3(f11, YC5, iA5); pp0 <- person_probs(f11, YC5, iA5)
+  isco0 <- suppressWarnings(as.numeric(as.character(w$ISCO_1D)))
+  est <- c(gradyan_ana = g0[["gradyan_ana"]], P_aktaran_el = g0[["P_aktaran_el"]], P_aktaran_diger = g0[["P_aktaran_diger"]],
+           gradyan_dar = g0[["gradyan_dar"]], gradyan_dijital = g0[["gradyan_dijital"]],
+           ISCO_5_9_vs_1_4 = mean(pp0$p_shift[!is.na(isco0) & isco0 >= 5]) - mean(pp0$p_shift[!is.na(isco0) & isco0 >= 1 & isco0 <= 4]))
+  ci <- do.call(rbind, lapply(names(est), function(v) data.frame(olcu = v, tahmin = est[[v]], ort = mean(bt[[v]], na.rm = TRUE),
+          SE = stats::sd(bt[[v]], na.rm = TRUE), lo_2.5 = stats::quantile(bt[[v]], .025, na.rm = TRUE),
+          hi_97.5 = stats::quantile(bt[[v]], .975, na.rm = TRUE), pct_sifir_alti = 100 * mean(bt[[v]] <= 0, na.rm = TRUE),
+          n_basarili = sum(!is.na(bt[[v]])))))
+  write_out(rnd(ci), "step11_bootstrap_ci.csv")
+}
+
+# ---------- 11c. observed occupation ----------
+if (needs_boot("step11_isco.csv")) {
+  pp <- person_probs(f11, YC5, iA5)
+  isco <- suppressWarnings(as.numeric(as.character(w$ISCO_1D))); skl <- suppressWarnings(as.numeric(as.character(w$Occupation_SkillGroup)))
+  emp <- !is.na(w$Job_Employed) & w$Job_Employed == 1
+  tab <- do.call(rbind, lapply(1:9, function(g) { i <- !is.na(isco) & isco == g
+    data.frame(grup = paste0("ISCO_", g), N_a = sum(i), N_b = NA, P_aktaran_a = mean(pp$p_shift[i]), P_aktaran_b = NA,
+               fark = NA, lo_2.5 = NA, hi_97.5 = NA, P_el_a = mean(pp$p_man[i]), P_el_b = NA) }))
+  contr <- list(
+    list(ad = "ISCO_5-9_vs_1-4", a = !is.na(isco) & isco >= 5, b = !is.na(isco) & isco >= 1 & isco <= 4),
+    list(ad = "ISCO_7-9_vs_1-3", a = !is.na(isco) & isco >= 7, b = !is.na(isco) & isco >= 1 & isco <= 3),
+    list(ad = "Beceri_1-2_vs_3-4", a = !is.na(skl) & skl <= 2, b = !is.na(skl) & skl >= 3),
+    list(ad = "ISCO_5-9_vs_1-4_ucretli", a = emp & !is.na(isco) & isco >= 5, b = emp & !is.na(isco) & isco >= 1 & isco <= 4))
+  set.seed(11011)
+  cres <- do.call(rbind, lapply(contr, function(k) { ia <- which(k$a); ib <- which(k$b)
+    bt <- replicate(B11_POST, mean(pp$p_shift[sample(ia, replace = TRUE)]) - mean(pp$p_shift[sample(ib, replace = TRUE)]))
+    data.frame(grup = k$ad, N_a = length(ia), N_b = length(ib), P_aktaran_a = mean(pp$p_shift[ia]), P_aktaran_b = mean(pp$p_shift[ib]),
+               fark = mean(pp$p_shift[ia]) - mean(pp$p_shift[ib]), lo_2.5 = stats::quantile(bt, .025), hi_97.5 = stats::quantile(bt, .975),
+               P_el_a = mean(pp$p_man[ia]), P_el_b = mean(pp$p_man[ib])) }))
+  isc <- rnd(rbind(cres, tab)); isc$n_boot <- B11_POST; write_out(isc, "step11_isco.csv")
+}
+
+# ---------- 11d. subgroups ----------
+if (!file.exists("step11_altgrup.csv")) {
+  fr <- w$Country == "France"; ukl <- w$Country == "United Kingdom"; emp <- !is.na(w$Job_Employed) & w$Job_Employed == 1
+  wuk <- w$Weight; nc <- table(w$Country); we <- as.numeric(1 / nc[w$Country])
+  pool <- function(ind, lab, wt = rep(1, nrow(w))) { ww <- ifelse(ind, wt, 0); ww[is.na(ww)] <- 0
+    data.frame(grup = lab, N = sum(ind), olcum = "ortak_olcum", t(grad3(f11, YC5, iA5, ww))) }
+  sepf <- function(rows_i, lab, wt = NULL) {
+    f <- tryCatch(lca2d_em(YC5[rows_i, ], iA5, iB5, KA11, KB11, nrep = NREP11), error = function(e) NULL)            # Route B: random
+    f0 <- tryCatch(lca2d_em(YC5[rows_i, ], iA5, iB5, KA11, KB11, nrep = 1, init = list(P = f11$P, thA = f11$thA, thB = f11$thB)),
+                   error = function(e) NULL)                                                                         # Route A: supplied
+    if (!is.null(f0) && (is.null(f) || f0$ll > f$ll)) f <- f0
+    if (is.null(f)) return(NULL)
+    data.frame(grup = lab, N = length(rows_i), olcum = "ayri_model", t(grad3(f, YC5[rows_i, ], iA5, wt))) }
+  sg <- rbind(pool(rep(TRUE, nrow(w)), "Tum_orneklem"), pool(rep(TRUE, nrow(w)), "Ulkelere_esit_agirlik", we),
+              pool(fr, "Fransa"), pool(ukl, "Birlesik_Krallik"), pool(ukl, "Birlesik_Krallik_agirlikli", wuk), pool(emp, "Sadece_ucretli"),
+              sepf(which(fr), "Fransa"), sepf(which(ukl), "Birlesik_Krallik"),
+              sepf(which(ukl), "Birlesik_Krallik_agirlikli", wuk[ukl]), sepf(which(emp), "Sadece_ucretli"))
+  write_out(rnd(sg), "step11_altgrup.csv")
+}
+
+# ---------- 11e. sensitivity: item deletion, thresholds c = 3 and c = 4 ----------
+if (!file.exists("step11_duyarlilik.csv")) {
+  rr <- list(fit_sum11(f11, YC5, "6x5_ana", iA5))
+  for (j in seq_along(tools)) {
+    Yd <- YC5[, -c(j, 8 + j)]; iAd <- 1:7; iBd <- 8:14
+    f <- tryCatch(lca2d_em(Yd, iAd, iBd, KA11, KB11, nrep = NREP11, init = list(P = f11$P, thA = f11$thA[-j], thB = f11$thB[-j])),
+                  error = function(e) NULL)                                                       # Route A: supplied + random
+    if (is.null(f)) f <- tryCatch(lca2d_em(Yd, iAd, iBd, KA11, KB11, nrep = NREP11), error = function(e) NULL)   # Route B
+    if (!is.null(f)) rr[[length(rr) + 1]] <- fit_sum11(f, Yd, paste0("cikarilan_", tools[j]), iAd)
+    message("step11 madde cikarma: ", tools[j])
+  }
+  for (th in c(3, 4)) {
+    Yt <- make_YC(w, th)
+    f <- tryCatch(lca2d_em(Yt, iA5, iB5, KA11, KB11, nrep = NREP11), error = function(e) NULL)                     # Route B
+    f0 <- tryCatch(lca2d_em(Yt, iA5, iB5, KA11, KB11, nrep = 1, init = list(P = f11$P, thA = f11$thA, thB = f11$thB)),
+                   error = function(e) NULL)                                                                          # Route A
+    if (!is.null(f0) && (is.null(f) || f0$ll > f$ll)) f <- f0
+    if (!is.null(f)) rr[[length(rr) + 1]] <- fit_sum11(f, Yt, paste0("esik", th), iA5)
+  }
+  write_out(rnd(do.call(rbind, rr)), "step11_duyarlilik.csv")
+}
+
+# ---------- 11f. measurement assumption ----------
+if (!file.exists("step11_olcum_varsayimi.csv")) {
+  man <- man_classes(f11, YC5, iA5, "ana"); gA <- ifelse(seq_len(f11$Ka) %in% man, 2, 1); bs <- shift_b(f11)
+  pM <- rowSums(f11$post[, f11$aOf %in% man, drop = FALSE])
+  res <- list()
+  for (q in seq_along(iB5)) { j <- iB5[q]; y <- YC5[, j]; ok <- !is.na(y)
+    for (b in seq_len(f11$Kb)) { pb <- rowSums(f11$post[, f11$bOf == b, drop = FALSE])
+      wM <- (pb * pM)[ok]; wO <- (pb * (1 - pM))[ok]; u <- (y[ok] == 2)
+      res[[length(res) + 1]] <- data.frame(madde = colnames(YC5)[j], B_sinif = b, aktaran = b == bs, model = f11$thB[[q]][b, 2],
+        gozlenen_el = sum(wM * u) / sum(wM), gozlenen_diger = sum(wO * u) / sum(wO), n_etkin_el = sum(wM), n_etkin_diger = sum(wO)) } }
+  res <- do.call(rbind, res); res$fark_el_diger <- res$gozlenen_el - res$gozlenen_diger
+  write_out(rnd(res), "step11_artik_kontrol.csv")
+  fd <- tryCatch(lca2d_em_dif(YC5, iA5, iB5, KA11, KB11, gA, init = list(P = f11$P, thA = f11$thA, thB = f11$thB)), error = function(e) NULL)  # Route A
+  if (is.null(fd)) fd <- tryCatch({ set.seed(11090); jit <- lapply(f11$thB, function(m) { m <- m + matrix(stats::runif(length(m), 0, .02), nrow(m)); m / rowSums(m) })
+    lca2d_em_dif(YC5, iA5, iB5, KA11, KB11, gA, init = list(P = f11$P, thA = f11$thA, thB = jit)) }, error = function(e) NULL)                    # Route B
+  g0 <- grad_def(f11, YC5, iA5, "ana")
+  oz <- data.frame(model = "6x5_esit_olcum", LL = f11$ll, npar = f11$npar, BIC = f11$bic, P_aktaran_el = g0[["P_aktaran_el"]],
+                   P_aktaran_diger = g0[["P_aktaran_diger"]], gradyan = g0[["gradyan"]])
+  if (!is.null(fd)) {
+    isM <- fd$aOf %in% man
+    oz <- rbind(oz, data.frame(model = "6x5_gevsetilmis", LL = fd$ll, npar = fd$npar, BIC = fd$bic,
+      P_aktaran_el = sum(fd$P[isM & fd$bOf == bs]) / sum(fd$P[isM]), P_aktaran_diger = sum(fd$P[!isM & fd$bOf == bs]) / sum(fd$P[!isM]),
+      gradyan = sum(fd$P[isM & fd$bOf == bs]) / sum(fd$P[isM]) - sum(fd$P[!isM & fd$bOf == bs]) / sum(fd$P[!isM])))
+    th_d <- do.call(rbind, lapply(seq_along(iB5), function(q) data.frame(madde = colnames(YC5)[iB5[q]], B_sinif = seq_len(f11$Kb),
+      P_odenmeyen_diger = fd$thB[[q]][seq_len(f11$Kb), 2], P_odenmeyen_el = fd$thB[[q]][f11$Kb + seq_len(f11$Kb), 2])))
+    th_d$fark <- th_d$P_odenmeyen_el - th_d$P_odenmeyen_diger
+    write_out(rnd(th_d), "step11_gevsetilmis_B.csv")
+  }
+  oz$LRT <- c(NA, if (nrow(oz) > 1) 2 * (oz$LL[2] - oz$LL[1])); oz$LRT_df <- c(NA, if (nrow(oz) > 1) oz$npar[2] - oz$npar[1])
+  write_out(rnd(oz), "step11_olcum_varsayimi.csv")
+}
+
+# ---------- 11g. auxiliary variables and 1D cross-table ----------
+if (!file.exists("step11_dogrulama.csv")) {
+  pB <- sapply(seq_len(f11$Kb), function(b) rowSums(f11$post[, f11$bOf == b, drop = FALSE]))
+  val_vars <- intersect(c("Autonomy_Place", "Autonomy_FlexiOptions", "Job_Employed", "Country"), names(w))
+  val <- do.call(rbind, lapply(val_vars, function(v) { x <- as.character(w[[v]]); x[is.na(x)] <- "NA"
+    do.call(rbind, lapply(sort(unique(x)), function(cat) { i <- x == cat
+      data.frame(degisken = v, kategori = cat, N = sum(i), t(setNames(colSums(pB[i, , drop = FALSE]) / colSums(pB), paste0("pay_B", seq_len(f11$Kb))))) })) }))
+  ap <- suppressWarnings(as.numeric(w$Autonomy_Place)); okp <- !is.na(ap)
+  val <- rbind(val, data.frame(degisken = "Autonomy_Place_ortalama", kategori = "1-5", N = sum(okp),
+    t(setNames(sapply(seq_len(f11$Kb), function(b) sum(pB[okp, b] * ap[okp]) / sum(pB[okp, b])), paste0("pay_B", seq_len(f11$Kb))))))
+  write_out(rnd(val), "step11_dogrulama.csv")
+}
+if (!file.exists("step11_1d_capraz.csv")) {
+  set.seed(2024); f1 <- run_lca(YC5, 3, nrep = NREP11)                   # same 1D solution as step07
+  h <- hidden_id(f1); c1 <- ifelse(apply(f1$post, 1, which.max) == h, "1D_el_emegi", "1D_diger")
+  pp <- person_probs(f11, YC5, iA5)
+  aMod <- apply(sapply(seq_len(f11$Ka), function(a) rowSums(f11$post[, f11$aOf == a, drop = FALSE])), 1, which.max)
+  bMod <- apply(sapply(seq_len(f11$Kb), function(b) rowSums(f11$post[, f11$bOf == b, drop = FALSE])), 1, which.max)
+  cr <- as.data.frame(table(sinif_1D = c1, A_2D = paste0("A", aMod), B_2D = paste0("B", bMod))); cr <- cr[cr$Freq > 0, ]
+  oz <- do.call(rbind, lapply(c("1D_el_emegi", "1D_diger"), function(g) { i <- c1 == g
+    data.frame(sinif_1D = g, A_2D = "ozet", B_2D = "ozet", Freq = sum(i), P_el_profili = mean(pp$p_man[i]), P_aktaran = mean(pp$p_shift[i])) }))
+  cr$P_el_profili <- NA; cr$P_aktaran <- NA
+  out <- rbind(cr, oz); out$ARI_1D_vs_2D_A <- round(ari(apply(f1$post, 1, which.max), aMod), 4)
+  write_out(rnd(out), "step11_1d_capraz.csv")
+}
+
+# ---------- 11h. gradient under three definitions in 18 models ----------
+if (!file.exists("step11_18model_uc_tanim.csv")) {
+  grid <- c(unlist(lapply(2:5, function(a) lapply(2:4, function(b) c(a, b))), recursive = FALSE),
+            list(c(6, 4), c(5, 5), c(6, 5), c(7, 5), c(6, 6), c(7, 6)))
+  ms <- list()
+  for (kk in grid) {
+    f <- if (all(kk == c(KA11, KB11))) f11 else tryCatch(lca2d_em(YC5, iA5, iB5, kk[1], kk[2], nrep = NREP10), error = function(e) NULL)
+    if (is.null(f)) next
+    ms[[length(ms) + 1]] <- data.frame(model = paste0(kk[1], "x", kk[2]), Ka = kk[1], Kb = kk[2], LL = f$ll, BIC = f$bic, t(grad3(f, YC5, iA5)))
+    message("step11h: ", kk[1], "x", kk[2], " tamam")
+  }
+  write_out(rnd(do.call(rbind, ms)), "step11_18model_uc_tanim.csv")
+}
+
+# ---------- 11i. high-burden thresholds 50%, 75%, 100% ----------
+if (needs_boot("step11_yuksek_yuk_esik.csv")) {
+  ND <- sapply(need_v, function(v) w[[v]] == 1); PD <- sapply(paid_v, function(v) w[[v]])
+  U2 <- ND & !is.na(PD) & PD >= 2; nN <- rowSums(ND); sh <- ifelse(nN > 0, rowSums(U2) / nN, NA)
+  isco <- suppressWarnings(as.numeric(as.character(w$ISCO_1D))); emp <- !is.na(w$Job_Employed) & w$Job_Employed == 1; pc0 <- w$Tools_PC == 0
+  grp <- list(PC_gerekmiyor_vs_gerekiyor = list(a = pc0, b = !pc0), PC_gerekmiyor_vs_gerekiyor_ucretli = list(a = pc0 & emp, b = !pc0 & emp),
+              ISCO_5_9_vs_1_4 = list(a = !is.na(isco) & isco >= 5, b = !is.na(isco) & isco >= 1 & isco <= 4))
+  set.seed(11111); out <- list()
+  for (gn in names(grp)) for (th in c(.50, .75, 1.00)) {
+    x <- as.numeric(sh >= th - 1e-9); ia <- which(grp[[gn]]$a & !is.na(sh)); ib <- which(grp[[gn]]$b & !is.na(sh))
+    bt <- replicate(B_ALL, mean(x[sample(ia, replace = TRUE)]) - mean(x[sample(ib, replace = TRUE)]))
+    out[[length(out) + 1]] <- data.frame(karsilastirma = gn, esik = th, n_boot = B_ALL, N_a = length(ia), N_b = length(ib), ort_a = mean(x[ia]),
+      ort_b = mean(x[ib]), fark = mean(x[ia]) - mean(x[ib]), lo_2.5 = stats::quantile(bt, .025), hi_97.5 = stats::quantile(bt, .975))
+  }
+  write_out(rnd(do.call(rbind, out)), "step11_yuksek_yuk_esik.csv")
+}
+
+# ---------- 11j. S13: data generated from the 6 x 5 model ----------
+if (!file.exists("step11_s13_montecarlo.csv")) {
+  manT <- man_classes(f11, YC5, iA5, "ana"); bsT <- shift_b(f11)
+  true_init <- list(P = f11$P, thA = f11$thA, thB = f11$thB)
+  fpart <- "step11_s13_tekrarlar.csv"
+  s13 <- if (file.exists(fpart)) rd(fpart) else NULL                     # resume from a previous run
+  start_r <- if (is.null(s13)) 1 else max(s13$tekrar) + 1; t0 <- Sys.time()
+  if (start_r <= MC_R11) for (r in start_r:MC_R11) {
+    set.seed(131000 + r); N <- nrow(YC5)
+    cell <- sample.int(length(f11$P), N, replace = TRUE, prob = f11$P); a <- f11$aOf[cell]; b <- f11$bOf[cell]
+    nd <- sapply(seq_along(tools), function(j) stats::rbinom(N, 1, f11$thA[[j]][a, 2]))
+    un <- sapply(seq_along(tools), function(j) stats::rbinom(N, 1, f11$thB[[j]][b, 2]))
+    YCs <- cbind(nd + 1, ifelse(nd == 1, un + 1, NA)); colnames(YCs) <- colnames(YC5)
+    YMs <- ifelse(nd == 0, 1, un + 1); colnames(YMs) <- paste0("M_", tools)
+    man <- a %in% manT; sh <- b == bsT; gap <- function(p) mean(p[man]) - mean(p[!man])
+    fr <- tryCatch(lca2d_em(YCs, iA5, iB5, KA11, KB11, nrep = NREP11), error = function(e) NULL)                 # Route B: random
+    ft <- tryCatch(lca2d_em(YCs, iA5, iB5, KA11, KB11, nrep = 1, init = true_init), error = function(e) NULL)    # Route A: true values
+    fM <- run_lca(YMs, 2, 5); fC <- run_lca(YCs, 4, 5)
+    g2 <- function(f) if (is.null(f)) c(NA, NA) else c(grad_def(f, YCs, iA5, "ana")[["gradyan"]],
+                                                       gap(rowSums(f$post[, f$bOf == shift_b(f), drop = FALSE])))
+    row <- data.frame(tekrar = r, gercek = gap(sh),
+      gercek_model = sum(f11$P[f11$aOf %in% manT & f11$bOf == bsT]) / sum(f11$P[f11$aOf %in% manT]) -
+                     sum(f11$P[!(f11$aOf %in% manT) & f11$bOf == bsT]) / sum(f11$P[!(f11$aOf %in% manT)]),
+      M = gap(shift_post4(fM, seq_along(tools))), C = gap(shift_post4(fC, 8 + seq_along(tools))),
+      C2B_model = g2(fr)[1], C2B_kisi = g2(fr)[2], C2B_model_gercek_bas = g2(ft)[1],
+      LL_rastgele = if (is.null(fr)) NA else fr$ll, LL_gercek_bas = if (is.null(ft)) NA else ft$ll)
+    s13 <- rbind(s13, row); write_out(s13, fpart)                         # checkpoint after each replicate
+    message("S13 (6x5) ", r, "/", MC_R11, " | ", round(difftime(Sys.time(), t0, units = "mins"), 1), " dk")
+  }
+  s13 <- rd(fpart); s13$rastgele_en_iyiye_ulasti <- s13$LL_rastgele >= s13$LL_gercek_bas - 0.01
+  oz <- do.call(rbind, lapply(c("M", "C", "C2B_model", "C2B_kisi", "C2B_model_gercek_bas"), function(m) {
+    e <- s13[[m]] - s13$gercek; e <- e[!is.na(e)]
+    data.frame(yontem = m, gercek = mean(s13$gercek), ort_tahmin = mean(s13[[m]], na.rm = TRUE), ort_yanlilik = mean(e),
+               MC_SE = stats::sd(e) / sqrt(length(e)), RMSE = sqrt(mean(e^2)), hata_gt_025_pct = 100 * mean(abs(e) > .25), n = length(e)) }))
+  oz$pct_rastgele_en_iyi <- 100 * mean(s13$rastgele_en_iyiye_ulasti, na.rm = TRUE)
+  write_out(rnd(oz), "step11_s13_montecarlo.csv")
+}
+message("step11 tamamlandi.")
+
+
+# =====================================================================
+# STEP12 - agreement of merged and conditional 1D typologies across numbers of classes
+#   12a. merged K = 2-5 x conditional K = 2-8: ARI grid
+#   12b. share of the hidden (manual) class assigned to the low-burden merged class at each conditional K
+# Route A: poLCA; Route B: own EM (automatic within run_lca)
+# =====================================================================
+NREP12 <- 10                                                             # number of starts (as in step02)
+if (!file.exists("step12_ari_izgara.csv")) {
+  fM12 <- list(); fC12 <- list()
+  for (K in 2:5) { set.seed(12000 + K); fM12[[K]] <- run_lca(YM, K, NREP12); message("step12 birlesik K = ", K) }
+  for (K in 2:8) { set.seed(12100 + K); fC12[[K]] <- run_lca(YC, K, NREP12); message("step12 kosullu K = ", K) }
+  J <- length(tools); out <- list()
+  for (kc in 2:8) {
+    fc <- fC12[[kc]]; cC <- max.col(fc$post); h <- hidden_id(fc); inH <- cC == h
+    unpH <- mean(sapply(seq_len(J), function(j) pk2(fc, J + j)[h]))      # mean unpaid probability in the hidden class
+    for (km in 2:5) {
+      fm <- fM12[[km]]; cM <- max.col(fm$post)
+      low <- which.min(sapply(seq_len(km), function(k) mean(sapply(seq_len(J), function(j) pk2(fm, j)[k]))))  # low-burden class
+      out[[length(out) + 1]] <- data.frame(birlesik_K = km, kosullu_K = kc, ARI = ari(cM, cC),
+        gizli_n = sum(inH), gizli_PC_ihtiyac = pk2(fc, which(tools == "PC"))[h], gizli_ort_odenmeme = unpH,
+        dusuk_yuk_payi_birlesik = mean(cM == low), gizliden_dusuk_yuke_pct = 100 * mean(cM[inH] == low),
+        yol_M = fm$yol, yol_C = fc$yol)
+    }
+  }
+  out <- do.call(rbind, out); num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
+  write_out(out, "step12_ari_izgara.csv")
+}
+message("step12 tamamlandi.")
+
+# =====================================================================
+# STEP13 - partial measurement invariance
+#   Compensation probabilities free between low-computer-need (manual + field) and other need profiles
+#   for selected items only; other items equal. LR, BIC and gradient for each model.
+#   Route A: start from the selected 6 x 5 solution; Route B: restart with small perturbation
+# =====================================================================
+lca2d_em_pdif <- function(Y, idxA, idxB, Ka, Kb, gA, free, init, maxit = 3000, tol = 1e-7) {
+  Y <- as.matrix(Y); N <- nrow(Y); R <- apply(Y, 2, max, na.rm = TRUE)
+  C <- Ka * Kb; aOf <- rep(seq_len(Ka), times = Kb); bOf <- rep(seq_len(Kb), each = Ka)
+  key <- (gA[aOf] - 1) * Kb + bOf                                        # cell -> (group, b) key
+  isF <- seq_along(idxB) %in% free                                       # freed B items
+  pc <- init$P; thA <- init$thA
+  thB <- lapply(seq_along(idxB), function(q) if (isF[q]) rbind(init$thB[[q]], init$thB[[q]]) else init$thB[[q]])
+  ll_old <- -Inf
+  for (it in seq_len(maxit)) {
+    LA <- matrix(0, N, Ka); LBb <- matrix(0, N, Kb); LBk <- matrix(0, N, 2 * Kb)
+    for (q in seq_along(idxA)) { y <- Y[, idxA[q]]; ok <- !is.na(y); LA[ok, ] <- LA[ok, ] + t(log(thA[[q]][, y[ok], drop = FALSE])) }
+    for (q in seq_along(idxB)) { y <- Y[, idxB[q]]; ok <- !is.na(y)
+      if (isF[q]) LBk[ok, ] <- LBk[ok, ] + t(log(thB[[q]][, y[ok], drop = FALSE]))
+      else        LBb[ok, ] <- LBb[ok, ] + t(log(thB[[q]][, y[ok], drop = FALSE])) }
+    lp <- LA[, aOf, drop = FALSE] + LBb[, bOf, drop = FALSE] + LBk[, key, drop = FALSE] + matrix(log(pc), N, C, byrow = TRUE)
+    mx <- apply(lp, 1, max); ll <- sum(mx + log(rowSums(exp(lp - mx))))
+    post <- exp(lp - mx); post <- post / rowSums(post); pc <- colMeans(post)
+    pA <- sapply(seq_len(Ka), function(a) rowSums(post[, aOf == a, drop = FALSE]))
+    pB <- sapply(seq_len(Kb), function(b) rowSums(post[, bOf == b, drop = FALSE]))
+    pK <- sapply(seq_len(2 * Kb), function(k) rowSums(post[, key == k, drop = FALSE]))
+    thA <- lapply(seq_along(idxA), function(q) { y <- Y[, idxA[q]]; ok <- !is.na(y)
+      m <- sapply(seq_len(R[idxA[q]]), function(cc) colSums(pA[ok & y == cc, , drop = FALSE])); m <- matrix(m, Ka) + 1e-10; m / rowSums(m) })
+    thB <- lapply(seq_along(idxB), function(q) { y <- Y[, idxB[q]]; ok <- !is.na(y); W <- if (isF[q]) pK else pB
+      m <- sapply(seq_len(R[idxB[q]]), function(cc) colSums(W[ok & y == cc, , drop = FALSE])); m <- matrix(m, ncol(W)) + 1e-10; m / rowSums(m) })
+    if (abs(ll - ll_old) < tol) break; ll_old <- ll
+  }
+  npar <- (C - 1) + Ka * sum(R[idxA] - 1) + Kb * sum(R[idxB[!isF]] - 1) + 2 * Kb * sum(R[idxB[isF]] - 1)
+  list(ll = ll, P = pc, post = post, thA = thA, thB = thB, npar = npar, bic = -2 * ll + log(N) * npar,
+       aOf = aOf, bOf = bOf, key = key, Ka = Ka, Kb = Kb, isF = isF)
+}
+if (!file.exists("step13_kismi_degismezlik.csv")) {
+  if (is.null(f11)) f11 <- lca2d_em(YC5, iA5, iB5, KA11, KB11, nrep = NREP11)            # same solution as step11
+  man <- man_classes(f11, YC5, iA5, "ana"); gA <- ifelse(seq_len(f11$Ka) %in% man, 2, 1); bs <- shift_b(f11)
+  itB <- sub("^C_", "", colnames(YC5)[iB5])
+  sets <- list(Tasima_giyim = c("Transportation", "Appearance"), Dijital = c("PC", "Phone", "Internet"),
+               Koruyucu = c("Safety", "Appearance"), Calisma_alani = "Workspace", Tum_kalemler = itB)
+  g0 <- grad_def(f11, YC5, iA5, "ana")
+  out <- data.frame(model = "Esit_olcum", serbest_kalemler = "-", LL = f11$ll, npar = f11$npar, BIC = f11$bic,
+                    LR = NA, df = NA, p = NA, P_aktaran_el = g0[["P_aktaran_el"]], P_aktaran_diger = g0[["P_aktaran_diger"]],
+                    gradyan = g0[["gradyan"]])
+  thl <- list(); init0 <- list(P = f11$P, thA = f11$thA, thB = f11$thB)
+  for (nm in names(sets)) {
+    fr <- which(itB %in% sets[[nm]])
+    fd <- tryCatch(lca2d_em_pdif(YC5, iA5, iB5, KA11, KB11, gA, fr, init0), error = function(e) NULL)              # Route A
+    if (is.null(fd)) fd <- tryCatch({ set.seed(13000 + length(fr))
+      jit <- lapply(f11$thB, function(m) { m <- m + matrix(stats::runif(length(m), 0, .02), nrow(m)); m / rowSums(m) })
+      lca2d_em_pdif(YC5, iA5, iB5, KA11, KB11, gA, fr, list(P = f11$P, thA = f11$thA, thB = jit)) }, error = function(e) NULL)  # Route B
+    if (is.null(fd)) next
+    isM <- fd$aOf %in% man; pm <- sum(fd$P[isM & fd$bOf == bs]) / sum(fd$P[isM]); po <- sum(fd$P[!isM & fd$bOf == bs]) / sum(fd$P[!isM])
+    LR <- 2 * (fd$ll - f11$ll); df <- fd$npar - f11$npar
+    out <- rbind(out, data.frame(model = nm, serbest_kalemler = paste(sets[[nm]], collapse = "+"), LL = fd$ll, npar = fd$npar,
+                                 BIC = fd$bic, LR = LR, df = df, p = stats::pchisq(LR, df, lower.tail = FALSE),
+                                 P_aktaran_el = pm, P_aktaran_diger = po, gradyan = pm - po))
+    for (q in fr) thl[[length(thl) + 1]] <- data.frame(model = nm, madde = itB[q], B_sinif = seq_len(f11$Kb), aktaran = seq_len(f11$Kb) == bs,
+      P_odenmeyen_diger = fd$thB[[q]][seq_len(f11$Kb), 2], P_odenmeyen_dusukPC = fd$thB[[q]][f11$Kb + seq_len(f11$Kb), 2])
+    message("step13: ", nm, " tamam")
+  }
+  num <- sapply(out, is.numeric); out[num] <- lapply(out[num], round, 4)
+  write_out(out, "step13_kismi_degismezlik.csv")
+  if (length(thl)) { th <- do.call(rbind, thl); th$fark <- th$P_odenmeyen_dusukPC - th$P_odenmeyen_diger
+    num <- sapply(th, is.numeric); th[num] <- lapply(th[num], round, 4); write_out(th, "step13_kismi_B.csv") }
+}
+message("step13 tamamlandi.")
+
+# =====================================================================
+# 6e. Figures (at the end; same file names, overwritten)
+#     Each figure: 1600 dpi PNG + vector PDF
+#     Figure 3: Monte Carlo error distribution, S1-S13
+#     Figure 1: P(compensation regime | need class), with class labels
+#     Figure 2: gradient across all models; main definition black circle, narrow definition grey star
+# =====================================================================
+use_gg <- requireNamespace("ggplot2", quietly = TRUE)                     # Route A: ggplot2; Route B: base R
+DPI_FIG <- 1600                                                          # resolution (all figures)
+th_fig <- function(base = 10) {                                          # common theme: spaced axis titles
+  ggplot2::theme_bw(base_size = base) + ggplot2::theme(
+    axis.title.x = ggplot2::element_text(margin = ggplot2::margin(t = 12)),
+    axis.title.y = ggplot2::element_text(margin = ggplot2::margin(r = 12)),
+    axis.text.x  = ggplot2::element_text(margin = ggplot2::margin(t = 5)),
+    axis.text.y  = ggplot2::element_text(margin = ggplot2::margin(r = 5)),
+    legend.text  = ggplot2::element_text(margin = ggplot2::margin(l = 4, r = 10)),
+    plot.margin  = ggplot2::margin(10, 14, 10, 10))
+}
+save_gg <- function(p, base, w, h) {                                     # PNG + PDF (Route A)
+  ggplot2::ggsave(paste0(base, ".png"), p, width = w, height = h, dpi = DPI_FIG, bg = "white")
+  dev_pdf <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf  # base pdf if cairo is unavailable
+  ggplot2::ggsave(paste0(base, ".pdf"), p, width = w, height = h, device = dev_pdf, bg = "white")
+}
+base_both <- function(base, w, h, draw) {                                # PNG + PDF (Route B, base R)
+  grDevices::png(paste0(base, ".png"), width = w, height = h, units = "in", res = DPI_FIG); draw(); grDevices::dev.off()
+  grDevices::pdf(paste0(base, ".pdf"), width = w, height = h); draw(); grDevices::dev.off()
+}
+
+# Figure 3: Monte Carlo error distribution, S1-S13
+if (file.exists("step04_montecarlo_tekrarlar.csv")) {
+  cols <- c("senaryo", "gercek", "M", "C", "C2B_model")
+  mt <- rd("step04_montecarlo_tekrarlar.csv")[, cols]
+  for (fx in c("step07_montecarlo_tekrarlar.csv", "step09_montecarlo_tekrarlar.csv"))   # S5-S12
+    if (file.exists(fx)) mt <- rbind(mt, rd(fx)[, cols])
+  s13f <- if (file.exists("step11_s13_montecarlo.csv")) "step11_s13_tekrarlar.csv" else "step10_s13_tekrarlar.csv"  # S13: main model (6 x 5)
+  if (file.exists(s13f)) {
+    s13 <- rd(s13f)
+    mt <- rbind(mt, data.frame(senaryo = "S13_gercekci", gercek = s13$gercek, M = s13$M, C = s13$C, C2B_model = s13$C2B_model))
+  }
+  sc <- c(S1_bagimsiz = "S1 No gradient", S2_bagimli = "S2 Gradient", S3_bagimli_guclu = "S3 Strong gradient",
+          S4_bagimli_el_emegi_az = "S4 Small manual group", S5_ihtiyac_yerel_bagimlilik = "S5 Local dep. (need)",
+          S6_odeme_yerel_bagimlilik = "S6 Local dep. (payment)", S7_uc_ihtiyac_profili = "S7 Three need profiles",
+          S8_uc_karsilama_rejimi = "S8 Three regimes", S9_kucuk_orneklem = "S9 N = 1,000",
+          S10_ihtiyaca_gore_odeme = "S10 Payment by need", S11_iki_maddede_etkilesim = "S11 Two-item interaction",
+          S12_ulkeye_gore_odeme = "S12 Payment by country", S13_gercekci = if (grepl("step11", s13f)) "S13 Empirical 6 x 5 model" else "S13 Empirical 5 x 4 model")
+  long <- do.call(rbind, lapply(c("M", "C", "C2B_model"), function(k) data.frame(Scenario = sc[mt$senaryo],
+            Method = c(M = "Merged", C = "Conditional 1D", C2B_model = "Conditional 2D")[[k]], Error = mt[[k]] - mt$gercek)))
+  long <- long[!is.na(long$Error) & !is.na(long$Scenario), ]
+  long$Scenario <- factor(long$Scenario, levels = unname(sc)[unname(sc) %in% long$Scenario])
+  long$Method <- factor(long$Method, levels = c("Merged", "Conditional 1D", "Conditional 2D"))
+  nr <- ceiling(nlevels(long$Scenario) / 3); hh <- 2.4 * nr + 0.9        # 3-column panel layout
+  ok <- FALSE
+  if (use_gg) ok <- tryCatch({
+    p1 <- ggplot2::ggplot(long, ggplot2::aes(x = Method, y = Error)) +
+      ggplot2::geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+      ggplot2::geom_boxplot(outlier.size = 0.6, fill = "grey85", linewidth = 0.4) + ggplot2::facet_wrap(~ Scenario, ncol = 3) +
+      ggplot2::labs(x = NULL, y = "Estimated minus true gradient") + th_fig(10) +
+      ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 25, hjust = 1, margin = ggplot2::margin(t = 6)),
+                     strip.text = ggplot2::element_text(margin = ggplot2::margin(4, 4, 4, 4)),
+                     panel.spacing = grid::unit(0.8, "lines"))
+    save_gg(p1, "fig1_montecarlo_bias", 7.5, hh); TRUE }, error = function(e) { message("Sekil 1 Yol A: ", conditionMessage(e)); FALSE })
+  if (!ok) base_both("fig1_montecarlo_bias", 7.5, hh, function() {       # Route B
+    graphics::par(mfrow = c(nr, 3), mar = c(7, 5, 2.5, 1), mgp = c(3.2, 0.8, 0))
+    for (s in levels(long$Scenario)) { d <- long[long$Scenario == s, ]
+      graphics::boxplot(Error ~ Method, data = d, las = 2, main = s, ylab = "Error", xlab = "", cex.axis = .7)
+      graphics::abline(h = 0, lty = 2) } })
+  message("Yazildi: fig1_montecarlo_bias.png / .pdf")
+}
+
+# Figure 1: P(B | A) in the selected model, with class labels
+# main model 6 x 5: class labels and display order (generic labels if left empty)
+LAB11A <- c("All-round\nmobile", "Digital and\nmobile", "Digital and\nprotective", "Mobile field", "Manual", "Desk work")  # model classes 1-6
+ORD11A <- c(6, 2, 3, 1, 4, 5)                                           # display order (as in Table 5)
+LAB11B <- c("Generous", "Cost-shifting", "Partial:\nmobility", "Partial:\ndigital", "Home office")  # model regimes 1-5
+ORD11B <- c(1, 5, 3, 4, 2)                                           # display order of compensation regimes
+hm_file <- if (file.exists("step11_6x5_hucreler.csv")) "step11_6x5_hucreler.csv" else "step05_secilen_hucreler.csv"
+if (file.exists(hm_file)) {
+  ce <- rd(hm_file)[, c("A_sinif", "B_sinif", "P_hucre")]
+  ce$PA <- stats::ave(ce$P_hucre, ce$A_sinif, FUN = sum); ce$PBgA <- ifelse(ce$PA > 0, ce$P_hucre / ce$PA, 0)
+  if (hm_file == "step05_secilen_hucreler.csv") {                        # earlier 5 x 4 labels
+    labA <- c("Digital and\nprotective", "Desk work", "Manual", "All-round\nmobile", "Mobile field"); ordA <- 1:5
+    labB <- c("Home office", "Generous", "Cost-shifting", "Partial"); ordB <- 1:4
+  } else {                                                               # 6 x 5
+    nA <- max(ce$A_sinif); nB <- max(ce$B_sinif)
+    labA <- if (length(LAB11A) == nA) LAB11A else paste("Need class", seq_len(nA))
+    labB <- if (length(LAB11B) == nB) LAB11B else paste("Regime", seq_len(nB))
+    ordA <- if (length(ORD11A) == nA) ORD11A else seq_len(nA); ordB <- if (length(ORD11B) == nB) ORD11B else seq_len(nB)
+  }
+  ce$Need <- factor(labA[ce$A_sinif], levels = rev(labA[ordA])); ce$Comp <- factor(labB[ce$B_sinif], levels = labB[ordB])
+  ce$txtcol <- ifelse(ce$PBgA > 0.6, "white", "black")                   # white text on dark cells
+  ok <- FALSE
+  if (use_gg) ok <- tryCatch({
+    p2 <- ggplot2::ggplot(ce, ggplot2::aes(x = Comp, y = Need, fill = PBgA)) +
+      ggplot2::geom_tile(colour = "grey60", linewidth = 0.3) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", PBgA), colour = txtcol), size = 3.4) +
+      ggplot2::scale_colour_identity() +
+      ggplot2::scale_fill_gradient(low = "white", high = "grey15", limits = c(0, 1), breaks = seq(0, 1, .25),
+                                   labels = c("0.00", "0.25", "0.50", "0.75", "1.00"), name = "P(regime | need class)") +
+      ggplot2::guides(fill = suppressWarnings(ggplot2::guide_colourbar(title.position = "top", title.hjust = 0.5,
+        barwidth = grid::unit(1.0, "lines"), barheight = grid::unit(11, "lines"),
+        frame.colour = "black", frame.linewidth = 0.4, ticks.colour = "black"))) +
+      ggplot2::scale_x_discrete(expand = c(0, 0)) + ggplot2::scale_y_discrete(expand = c(0, 0)) +
+      ggplot2::labs(x = "Compensation regime", y = "Need class") + th_fig(10) +
+      ggplot2::theme(panel.grid = ggplot2::element_blank(), panel.border = ggplot2::element_rect(colour = "grey40", fill = NA),
+                     legend.margin = ggplot2::margin(6, 8, 6, 8), legend.box.margin = ggplot2::margin(0, 0, 0, 14),
+                     legend.background = ggplot2::element_rect(colour = "grey40", linewidth = 0.3),
+                     legend.title = ggplot2::element_text(size = 9, margin = ggplot2::margin(b = 8)))
+    save_gg(p2, "fig2_need_by_compensation", 7, 4.6); TRUE }, error = function(e) { message("Sekil 2 Yol A: ", conditionMessage(e)); FALSE })
+  if (!ok) { mtx <- tapply(ce$PBgA, list(ce$Need, ce$Comp), sum)
+    base_both("fig2_need_by_compensation", 7, 4.6, function() {
+      graphics::layout(matrix(1:2, 1), widths = c(5, 1)); graphics::par(mar = c(5, 9, 1, 1), mgp = c(3.5, 0.8, 0))
+      cl <- grDevices::grey.colors(100, 1, .15)
+      graphics::image(seq_len(ncol(mtx)), seq_len(nrow(mtx)), t(mtx), col = cl, zlim = c(0, 1), axes = FALSE, xlab = "Compensation regime", ylab = "")
+      graphics::axis(1, at = seq_len(ncol(mtx)), labels = colnames(mtx), cex.axis = .8)
+      graphics::axis(2, at = seq_len(nrow(mtx)), labels = gsub("\n", " ", rownames(mtx)), las = 1, cex.axis = .8)
+      graphics::text(rep(seq_len(ncol(mtx)), each = nrow(mtx)), rep(seq_len(nrow(mtx)), ncol(mtx)), sprintf("%.2f", mtx),
+                     col = ifelse(mtx > .6, "white", "black"), cex = .8); graphics::box()
+      graphics::par(mar = c(5, 1, 3, 4)); graphics::image(1, seq(0, 1, length.out = 100), t(matrix(seq(0, 1, length.out = 100))),
+                     col = cl, axes = FALSE, xlab = "", ylab = ""); graphics::axis(4, las = 1); graphics::box()
+      graphics::mtext("P(regime | need)", 3, line = 0.8, cex = .7) }) }
+  message("Yazildi: fig2_need_by_compensation.png / .pdf")
+}
+
+# Figure 2: gradient, all models (BIC order)
+if (file.exists("step06_12model_gradyan.csv")) {
+  if (file.exists("step10_model_secimi.csv")) {                          # 18 models, two definitions (step10)
+    g <- rd("step10_model_secimi.csv")[, c("Ka", "Kb", "BIC", "gradyan_eski", "gradyan_yeni")]
+  } else {
+    g <- rd("step06_12model_gradyan.csv")[, c("Ka", "Kb", "BIC", "gradyan_eski", "gradyan_yeni")]
+    if (file.exists("step07_duyarlilik.csv")) {
+      d7 <- rd("step07_duyarlilik.csv"); d7 <- d7[d7$model %in% c("2B_A6_B4", "2B_A5_B5", "2B_A6_B5"), ]
+      if (nrow(d7)) g <- rbind(g, data.frame(Ka = d7$Ka, Kb = d7$Kb, BIC = d7$BIC, gradyan_eski = NA, gradyan_yeni = d7$gradyan))
+    }
+  }
+  g$gradyan_dijital <- NA
+  if (file.exists("step11_18model_uc_tanim.csv")) {                      # third definition: digital-need score (step11)
+    g3 <- rd("step11_18model_uc_tanim.csv"); g$gradyan_dijital <- g3$gradyan_dijital[match(paste(g$Ka, g$Kb), paste(g3$Ka, g3$Kb))]
+  }
+  g <- g[order(g$BIC), ]
+  g$lab <- paste0(g$Ka, " x ", g$Kb); g$lab <- factor(g$lab, levels = rev(g$lab))
+  defs <- c("Main: all need classes with computer need < 0.5", "Narrower: single lowest-computer-need class",
+            "Digital: mean need for computer, phone and internet < 0.5")
+  gl <- rbind(data.frame(lab = g$lab, Definition = defs[1], Gradient = g$gradyan_yeni),
+              data.frame(lab = g$lab, Definition = defs[2], Gradient = g$gradyan_eski),
+              data.frame(lab = g$lab, Definition = defs[3], Gradient = g$gradyan_dijital))
+  gl <- gl[!is.na(gl$Gradient), ]; defs <- defs[defs %in% gl$Definition]; gl$Definition <- factor(gl$Definition, levels = defs)
+  off <- if (length(defs) == 3) c(0.24, -0.24, 0) else c(0.17, -0.17)    # separate definitions vertically
+  gl$y <- as.numeric(gl$lab) + off[as.integer(gl$Definition)]
+  SEL_MODEL <- if (file.exists("step11_6x5_ozet.csv")) "6 x 5" else "5 x 4"  # main model row
+  sel <- which(levels(g$lab) == SEL_MODEL)
+  ok <- FALSE
+  if (use_gg) ok <- tryCatch({
+    p3 <- ggplot2::ggplot(gl, ggplot2::aes(x = Gradient, y = y, shape = Definition, colour = Definition)) +
+      ggplot2::annotate("rect", xmin = -Inf, xmax = Inf, ymin = sel - 0.45, ymax = sel + 0.45, fill = "grey92") +
+      ggplot2::geom_vline(xintercept = 0, linetype = 2, colour = "grey40") +
+      ggplot2::geom_point(size = 2.6, stroke = 0.9) +
+      ggplot2::scale_shape_manual(values = c(16, 8, 2)[seq_along(defs)]) +  # black circle / grey star / triangle
+      ggplot2::scale_colour_manual(values = c("black", "grey55", "grey30")[seq_along(defs)]) +
+      ggplot2::scale_y_continuous(breaks = seq_along(levels(g$lab)), labels = levels(g$lab), expand = ggplot2::expansion(add = 0.6)) +
+      ggplot2::labs(x = "Need-profile gradient in cost-shifting", y = "Need x compensation classes (ordered by BIC)",
+                    shape = NULL, colour = NULL) + th_fig(10) +
+      ggplot2::theme(legend.position = "bottom", legend.direction = "vertical", panel.grid.minor.y = ggplot2::element_blank(),
+                     legend.margin = ggplot2::margin(t = 6))
+    save_gg(p3, "fig3_gradient_across_models", 6.5, 7); TRUE }, error = function(e) { message("Sekil 3 Yol A: ", conditionMessage(e)); FALSE })
+  if (!ok) base_both("fig3_gradient_across_models", 6.5, 6, function() {
+    graphics::par(mar = c(6, 7, 1, 1), mgp = c(3.5, 0.8, 0)); yy <- rev(seq_len(nrow(g)))  # best BIC at the top
+    graphics::plot(g$gradyan_yeni, yy + 0.17, pch = 16, yaxt = "n", xlab = "Need-profile gradient", ylab = "",
+                   xlim = range(c(0, g$gradyan_eski, g$gradyan_yeni), na.rm = TRUE), ylim = c(0.5, nrow(g) + 0.5))
+    graphics::points(g$gradyan_eski, yy - 0.17, pch = 8, col = "grey55")
+    if (any(!is.na(g$gradyan_dijital))) graphics::points(g$gradyan_dijital, yy, pch = 2, col = "grey30")
+    graphics::axis(2, at = yy, labels = paste0(g$Ka, " x ", g$Kb), las = 1); graphics::abline(v = 0, lty = 2)
+    graphics::legend("bottomright", c("Main definition", "Narrower definition", "Digital-need definition"), pch = c(16, 8, 2), col = c("black", "grey55", "grey30"), bty = "n") })
+  message("Yazildi: fig3_gradient_across_models.png / .pdf")
+}
